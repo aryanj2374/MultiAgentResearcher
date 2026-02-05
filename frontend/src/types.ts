@@ -87,21 +87,42 @@ export type Theme = "dark" | "light";
 // Agent progress tracking types
 export type AgentStatus = "pending" | "running" | "completed" | "failed";
 
-export type AgentName = "retriever" | "extractor" | "critic" | "synthesizer" | "referee";
+export type AgentName = "planner" | "retriever" | "extractor" | "critic" | "synthesizer" | "referee";
 
 export type AgentProgress = Record<AgentName, AgentStatus>;
 
+export type SubQuestionProgress = {
+  sub_question: string;
+  status: AgentStatus;
+  papers_found?: number;
+};
+
+export type ResearchPlan = {
+  is_complex: boolean;
+  original_question: string;
+  sub_questions: string[];
+  strategy: "direct" | "decompose";
+  reasoning: string;
+};
+
 export type ProgressEvent = {
-  type: "progress" | "result" | "error";
+  type: "progress" | "result" | "error" | "deep_research_start" | "sub_question_progress";
   agent?: AgentName;
   status?: AgentStatus;
   message?: string;
   data?: BackendResponse;
+  // Deep research fields
+  plan?: ResearchPlan;
+  sub_questions?: string[];
+  index?: number;
+  sub_question?: string;
+  papers_found?: number;
 };
 
-export const AGENT_NAMES: AgentName[] = ["retriever", "extractor", "critic", "synthesizer", "referee"];
+export const AGENT_NAMES: AgentName[] = ["planner", "retriever", "extractor", "critic", "synthesizer", "referee"];
 
 export const AGENT_LABELS: Record<AgentName, string> = {
+  planner: "Planner",
   retriever: "Retriever",
   extractor: "Extractor",
   critic: "Critic",
@@ -111,6 +132,7 @@ export const AGENT_LABELS: Record<AgentName, string> = {
 
 export function createInitialProgress(): AgentProgress {
   return {
+    planner: "pending",
     retriever: "pending",
     extractor: "pending",
     critic: "pending",
@@ -118,3 +140,4 @@ export function createInitialProgress(): AgentProgress {
     referee: "pending",
   };
 }
+

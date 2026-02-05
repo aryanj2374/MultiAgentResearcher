@@ -79,6 +79,27 @@ class Verification(BaseModel):
     revised_synthesis: Synthesis | None = None
 
 
+class SubQuestionResult(BaseModel):
+    """Result from processing a single sub-question in deep research mode."""
+    model_config = ConfigDict(extra="ignore")
+    
+    sub_question: str
+    papers: list[Paper]
+    extractions: list[StudyExtraction]
+    critiques: list[Critique]
+
+
+class ResearchPlan(BaseModel):
+    """Output from the Planner agent."""
+    model_config = ConfigDict(extra="ignore")
+    
+    is_complex: bool
+    original_question: str
+    sub_questions: list[str]
+    strategy: str  # "direct" | "decompose"
+    reasoning: str
+
+
 class RunResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -90,7 +111,11 @@ class RunResponse(BaseModel):
     synthesis: Synthesis
     verification: Verification
     logs: dict[str, Any] | None = None
+    # Deep research fields
+    plan: ResearchPlan | None = None
+    sub_results: list[SubQuestionResult] | None = None
 
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=500)
+

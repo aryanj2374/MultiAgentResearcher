@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import AsyncGenerator
 
@@ -39,9 +40,37 @@ async def ask(payload: AskRequest) -> RunResponse:
 
 
 async def generate_sse_events(question: str) -> AsyncGenerator[str, None]:
-    """Generate SSE events for agent progress and final result."""
-    async for event in run_question_with_progress(question):
-        yield f"data: {json.dumps(event)}\n\n"
+    """Generate SSE events for agent progress and final result with keep-alive."""
+    iterator = run_question_with_progress(question).__aiter__()
+    pending_task: asyncio.Task | None = None
+    
+    while True:
+        try:
+            # Create a task for the next event if we don't have one pending
+            if pending_task is None:
+                pending_task = asyncio.create_task(iterator.__anext__())
+            
+            # Wait for the event with a 15-second timeout
+            done, _ = await asyncio.wait({pending_task}, timeout=15.0)
+            
+            if done:
+                # Event is ready, get the result
+                try:
+                    event = pending_task.result()
+                    yield f"data: {json.dumps(event)}\n\n"
+                    pending_task = None  # Clear so we fetch the next event
+                except StopAsyncIteration:
+                    break
+            else:
+                # Timeout - send keep-alive but keep the task pending
+                yield ": keep-alive\n\n"
+        except StopAsyncIteration:
+            break
+        except Exception:
+            # If there's an error, clean up and exit
+            if pending_task and not pending_task.done():
+                pending_task.cancel()
+            break
 
 
 @app.post("/api/ask/stream")

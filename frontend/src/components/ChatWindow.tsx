@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { AgentProgress, Conversation } from "../types";
+import type { AgentProgress, Conversation, SubQuestionProgress } from "../types";
 import AgentProgressWidget from "./AgentProgressWidget";
 import Header from "./Header";
 import Message from "./Message";
@@ -8,6 +8,8 @@ type ChatWindowProps = {
   conversation: Conversation | null;
   loading: boolean;
   agentProgress: AgentProgress | null;
+  subQuestionProgress?: SubQuestionProgress[] | null;
+  isDeepResearch?: boolean;
   onToggleSidebar: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
@@ -18,6 +20,8 @@ export default function ChatWindow({
   conversation,
   loading,
   agentProgress,
+  subQuestionProgress,
+  isDeepResearch,
   onToggleSidebar,
   theme,
   onToggleTheme,
@@ -63,7 +67,11 @@ export default function ChatWindow({
                 <div className="message-inner">
                   <div className="avatar assistant">MA</div>
                   <div className="bubble assistant">
-                    <AgentProgressWidget progress={agentProgress} />
+                    <AgentProgressWidget 
+                      progress={agentProgress} 
+                      subQuestions={subQuestionProgress ?? undefined}
+                      isDeepResearch={isDeepResearch}
+                    />
                   </div>
                 </div>
               </div>

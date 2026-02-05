@@ -4,7 +4,7 @@ import Composer from "./components/Composer";
 import Sidebar from "./components/Sidebar";
 import { askQuestionStream } from "./lib/api";
 import { loadConversations, loadTheme, saveConversations, saveTheme } from "./lib/storage";
-import type { AgentName, AgentProgress, BackendResponse, Conversation, Message, Theme } from "./types";
+import type { AgentName, AgentProgress, BackendResponse, Conversation, Message, SubQuestionProgress, Theme } from "./types";
 import { createInitialProgress } from "./types";
 
 function createId() {
@@ -35,11 +35,25 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>("dark");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [agentProgress, setAgentProgress] = useState<AgentProgress | null>(null);
+  const [subQuestionProgress, setSubQuestionProgress] = useState<SubQuestionProgress[] | null>(null);
+  const [isDeepResearch, setIsDeepResearch] = useState(false);
 
   useEffect(() => {
     const stored = loadConversations();
-    setConversations(stored);
-    if (stored[0]) setActiveId(stored[0].id);
+    if (stored.length > 0) {
+      setConversations(stored);
+      setActiveId(stored[0].id);
+    } else {
+      // Auto-create a new conversation on first load
+      const newConv: Conversation = {
+        id: createId(),
+        title: "New chat",
+        createdAt: now(),
+        messages: [],
+      };
+      setConversations([newConv]);
+      setActiveId(newConv.id);
+    }
     const storedTheme = loadTheme();
     if (storedTheme) setTheme(storedTheme);
   }, []);
@@ -133,6 +147,8 @@ export default function App() {
 
     // Initialize progress tracking
     setAgentProgress(createInitialProgress());
+    setSubQuestionProgress(null);
+    setIsDeepResearch(false);
 
     try {
       let finalResponse: BackendResponse | null = null;
@@ -142,6 +158,22 @@ export default function App() {
           setAgentProgress((prev) => 
             prev ? { ...prev, [event.agent as AgentName]: event.status! } : prev
           );
+        } else if (event.type === "deep_research_start" && event.sub_questions) {
+          // Planner has decomposed the question
+          setIsDeepResearch(true);
+          setSubQuestionProgress(
+            event.sub_questions.map((sq) => ({ sub_question: sq, status: "pending" as const }))
+          );
+        } else if (event.type === "sub_question_progress") {
+          // Update individual sub-question progress
+          setSubQuestionProgress((prev) => {
+            if (!prev || event.index === undefined) return prev;
+            return prev.map((sq, idx) =>
+              idx === event.index
+                ? { ...sq, status: event.status!, papers_found: event.papers_found }
+                : sq
+            );
+          });
         } else if (event.type === "result" && event.data) {
           finalResponse = event.data;
         } else if (event.type === "error") {
@@ -179,6 +211,8 @@ export default function App() {
     } finally {
       setLoading(false);
       setAgentProgress(null);
+      setSubQuestionProgress(null);
+      setIsDeepResearch(false);
     }
   }, [activeId, appendTypingMessage, composerText, updateConversation]);
 
@@ -201,6 +235,8 @@ export default function App() {
 
       // Initialize progress tracking
       setAgentProgress(createInitialProgress());
+      setSubQuestionProgress(null);
+      setIsDeepResearch(false);
 
       try {
         let finalResponse: BackendResponse | null = null;
@@ -210,6 +246,20 @@ export default function App() {
             setAgentProgress((prev) => 
               prev ? { ...prev, [event.agent as AgentName]: event.status! } : prev
             );
+          } else if (event.type === "deep_research_start" && event.sub_questions) {
+            setIsDeepResearch(true);
+            setSubQuestionProgress(
+              event.sub_questions.map((sq) => ({ sub_question: sq, status: "pending" as const }))
+            );
+          } else if (event.type === "sub_question_progress") {
+            setSubQuestionProgress((prev) => {
+              if (!prev || event.index === undefined) return prev;
+              return prev.map((sq, idx) =>
+                idx === event.index
+                  ? { ...sq, status: event.status!, papers_found: event.papers_found }
+                  : sq
+              );
+            });
           } else if (event.type === "result" && event.data) {
             finalResponse = event.data;
           } else if (event.type === "error") {
@@ -247,6 +297,8 @@ export default function App() {
       } finally {
         setLoading(false);
         setAgentProgress(null);
+        setSubQuestionProgress(null);
+        setIsDeepResearch(false);
       }
     },
     [activeId, updateConversation]
@@ -272,6 +324,8 @@ export default function App() {
           conversation={activeConversation}
           loading={loading}
           agentProgress={agentProgress}
+          subQuestionProgress={subQuestionProgress}
+          isDeepResearch={isDeepResearch}
           onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           theme={theme}
           onToggleTheme={handleToggleTheme}
