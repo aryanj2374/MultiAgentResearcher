@@ -1,62 +1,95 @@
-**Overview**
-This app takes a natural-language research question and runs a multi-agent pipeline to retrieve papers from Semantic Scholar, extract structured evidence, critique study quality, synthesize a citation-grounded answer with confidence, and verify citations before returning results in a single response.
+# Multi-Agent Scientific Research Assistant
 
-**Architecture**
-```
-[Client]
-   | POST /api/ask
-   v
-[FastAPI]
-   |
-   v
-[Orchestrator]
-   |-> RetrieverAgent -> Semantic Scholar API
-   |-> ExtractorAgent -> Hugging Face LLM
-   |-> QualityCriticAgent -> Hugging Face LLM
-   |-> SynthesizerAgent -> Hugging Face LLM
-   |-> RefereeAgent -> verification checks
-   v
-[Run Storage] -> backend/data/runs/<run_id>.json
+A powerful research assistant that uses a multi-agent AI pipeline to answer scientific questions. It retrieves papers from Semantic Scholar, analyzes them using LLMs, and synthesizes evidence-based answers with citations, confidence scores, and bias assessments.
+
+## ✨ Key Features
+
+- **Deep Research Mode**: Automatically breaks down complex questions into sub-questions and researches them in parallel.
+- **Multi-Agent Pipeline**:
+  - **Planner Agent**: Decomposes queries and determines research strategy.
+  - **Retriever Agent**: Searches Semantic Scholar for relevant academic papers.
+  - **Extractor Agent**: Extracts key findings, sample sizes, and study types from abstracts.
+  - **Critic Agent**: Assesses risk of bias and methodological quality.
+  - **Synthesizer Agent**: Groups findings by theme and produces a direct, citation-grounded answer.
+  - **Referee Agent**: Verifies that citations match the claims made.
+- **Real-time Progress Transparency**: Watch the agents work in real-time with a modern, glassmorphism-styled UI widget.
+- **Evidence Table**: View structured data extraction for every cited paper (Study Type, Effect Direction, Bias Risk).
+- **Quality Metrics**: Every answer includes a confidence score and rationale based on evidence quality (RCTs > Observational).
+
+## ARCHITECTURE
+
+```mermaid
+graph TD
+    User[User Query] --> API[FastAPI Backend]
+    API --> Planner[Planner Agent]
+    
+    Planner -- "Simple Query" --> SingleFlow
+    Planner -- "Complex Query" --> DeepResearch[Deep Research Mode]
+    
+    subgraph SingleFlow [Standard Research Flow]
+        Retriever[Retriever Agent] --> Extractor[Extractor Agent]
+        Extractor --> Critic[Critic Agent]
+    end
+    
+    subgraph DeepResearch [Parallel Sub-Questions]
+        SubQ1[Sub-Question 1] --> Flow1[Standard Flow]
+        SubQ2[Sub-Question 2] --> Flow2[Standard Flow]
+        SubQ3[Sub-Question 3] --> Flow3[Standard Flow]
+    end
+    
+    SingleFlow --> Synthesizer[Synthesizer Agent]
+    DeepResearch --> Synthesizer
+    
+    Synthesizer --> Referee[Referee Agent]
+    Referee --> UI[Frontend UI]
 ```
 
-**Setup**
-1. Backend dependencies:
-```
+## 🛠️ Setup
+
+### 1. Backend
+
+```bash
 cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
-2. Optional environment variables (in `backend/.env` or your shell):
+
+**Configuration (`backend/.env`):**
+```env
+HF_TOKEN=your_huggingface_token
+HF_MODEL=meta-llama/Llama-3.1-8B-Instruct
+SEMANTIC_SCHOLAR_API_KEY=optional_key
 ```
-HF_TOKEN=...
-HF_MODEL=...
-SEMANTIC_SCHOLAR_API_KEY=...
-```
-If no LLM key is set, the backend falls back to heuristic summaries and critiques.
-3. Run backend:
-```
-cd backend
+
+Run the server:
+```bash
 uvicorn main:app --reload
 ```
-4. Frontend dependencies:
-```
+
+### 2. Frontend
+
+```bash
 cd frontend
 npm install
-```
-5. Run frontend:
-```
-cd frontend
 npm run dev
 ```
 
-**Example Questions**
-- Does mindfulness improve sleep quality in adults?
-- Do GLP-1 agonists reduce cardiovascular risk in patients with type 2 diabetes?
-- What is the evidence that urban green space reduces anxiety?
+## 🚀 Usage
 
-**Limitations / Next Steps**
-- Abstract-only extraction can miss methods, results, and bias details.
-- The referee pass is deterministic; future work could include a second LLM judge.
-- Add full-text retrieval, PDF parsing, and stronger citation disambiguation.
-- Add async streaming updates for each agent stage in the UI.
+1. Open `http://localhost:5173`
+2. Ask a research question (e.g., *"Does mindfulness meditation improve sleep quality?"*)
+3. Watch the agents plan, retrieve, extract, and synthesize.
+4. Review the final answer, confidence score, and evidence table.
+
+## 🧠 Agent details
+
+- **Planner**: Uses heuristics and LLM to decide if a question needs decomposition.
+- **Extractor**: Extracts structured data (N, population, effect size) from abstracts using keyword pattern matching and LLM refinement.
+- **Synthesizer**: Weighs evidence (Meta-analysis > RCT) and synthesizes findings into themes, prioritizing a direct answer to the user's question.
+
+## ⚠️ Limitations
+
+- Analysis is primarily abstract-based (full-text analysis is a future goal).
+- "Deep Research" mode can take longer (30-60s) but provides more comprehensive coverage.
+- Requires a HuggingFace API token for optimal quality (falls back to heuristics if unavailable).
