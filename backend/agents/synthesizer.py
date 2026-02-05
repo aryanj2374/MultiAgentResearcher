@@ -9,6 +9,11 @@ from utils import citation_label, safe_json_loads
 
 SYNTH_SYSTEM = """You synthesize evidence into a concise, citation-grounded answer.
 Every bullet or paragraph MUST include inline citations like [AuthorYear].
+If no papers were found, acknowledge this and provide general guidance.
+Return ONLY valid JSON matching the schema."""
+
+NO_EVIDENCE_SYSTEM = """You are a helpful research assistant. The user asked a research question but no academic papers were found.
+Provide a helpful response acknowledging the lack of search results and offering suggestions.
 Return ONLY valid JSON matching the schema."""
 
 
@@ -20,12 +25,41 @@ def _build_citation_map(papers: List[Paper]) -> dict[str, str]:
     return mapping
 
 
+def _no_evidence_synthesis(question: str) -> Synthesis:
+    """Generate a helpful synthesis when no papers were found."""
+    return Synthesis(
+        final_answer=[
+            "No academic papers were found for this specific query.",
+            "This could be due to the search terms being too specific or the topic being emerging/niche.",
+            "Try rephrasing your question with broader or alternative terms.",
+            "Consider searching for related concepts or breaking down your question into smaller parts.",
+            "You may also want to search directly on Google Scholar or PubMed for more comprehensive results.",
+        ],
+        evidence_consensus="Unable to synthesize evidence as no papers were retrieved from Semantic Scholar.",
+        top_limitations_overall=[
+            "No papers found - synthesis is based on general guidance only.",
+            "The Semantic Scholar API may have rate limits or connectivity issues.",
+            "Some topics may not be well-indexed in the database.",
+        ],
+        confidence_score=0,
+        confidence_rationale=[
+            "Confidence is 0 because no academic evidence was retrieved to support any claims.",
+            "This response provides search guidance rather than evidence-based conclusions.",
+        ],
+        citations_used=[],
+    )
+
+
 def _fallback_synthesis(
     question: str,
     papers: List[Paper],
     extractions: List[StudyExtraction],
     critiques: List[Critique],
 ) -> Synthesis:
+    # Handle empty paper list
+    if not papers:
+        return _no_evidence_synthesis(question)
+    
     citation_map = _build_citation_map(papers)
     bullets: List[str] = []
     citations_used: List[str] = []
@@ -69,6 +103,7 @@ def _fallback_synthesis(
     )
 
 
+
 def _build_prompt(
     question: str,
     papers: List[Paper],
@@ -109,6 +144,10 @@ async def synthesize(
     llm: ChatLLM,
     issues: List[str] | None = None,
 ) -> Synthesis:
+    # Always use no-evidence synthesis when no papers found
+    if not papers:
+        return _no_evidence_synthesis(question)
+    
     if not llm.available:
         return _fallback_synthesis(question, papers, extractions, critiques)
 
@@ -123,3 +162,4 @@ async def synthesize(
         return Synthesis.model_validate(data)
     except (LLMUnavailableError, LLMRequestError, ValueError):
         return _fallback_synthesis(question, papers, extractions, critiques)
+

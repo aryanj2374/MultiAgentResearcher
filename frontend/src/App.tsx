@@ -2,9 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import ChatWindow from "./components/ChatWindow";
 import Composer from "./components/Composer";
 import Sidebar from "./components/Sidebar";
-import { askQuestion } from "./lib/api";
+import { askQuestionStream } from "./lib/api";
 import { loadConversations, loadTheme, saveConversations, saveTheme } from "./lib/storage";
-import type { BackendResponse, Conversation, Message, Theme } from "./types";
+import type { AgentName, AgentProgress, BackendResponse, Conversation, Message, Theme } from "./types";
+import { createInitialProgress } from "./types";
 
 function createId() {
   return crypto.randomUUID();
@@ -33,6 +34,7 @@ export default function App() {
   const [composerText, setComposerText] = useState("");
   const [theme, setTheme] = useState<Theme>("dark");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [agentProgress, setAgentProgress] = useState<AgentProgress | null>(null);
 
   useEffect(() => {
     const stored = loadConversations();
@@ -76,7 +78,6 @@ export default function App() {
 
   const handleSelectConversation = useCallback((id: string) => {
     setActiveId(id);
-    setSidebarOpen(false);
   }, []);
 
   const appendTypingMessage = useCallback((convoId: string, question: string) => {
@@ -130,20 +131,38 @@ export default function App() {
 
     const typingId = appendTypingMessage(convoId, question);
 
+    // Initialize progress tracking
+    setAgentProgress(createInitialProgress());
+
     try {
-      const response = await askQuestion(question);
-      updateConversation(convoId, (conv) => {
-        const messages = conv.messages.map((msg) =>
-          msg.id === typingId
-            ? {
-                ...msg,
-                meta: { response, request: { question } },
-                content: buildSummary(question, response),
-              }
-            : msg
-        );
-        return { ...conv, messages, title: buildTitle(messages) };
-      });
+      let finalResponse: BackendResponse | null = null;
+
+      for await (const event of askQuestionStream(question)) {
+        if (event.type === "progress" && event.agent && event.status) {
+          setAgentProgress((prev) => 
+            prev ? { ...prev, [event.agent as AgentName]: event.status! } : prev
+          );
+        } else if (event.type === "result" && event.data) {
+          finalResponse = event.data;
+        } else if (event.type === "error") {
+          throw new Error(event.message || "Request failed");
+        }
+      }
+
+      if (finalResponse) {
+        updateConversation(convoId, (conv) => {
+          const messages = conv.messages.map((msg) =>
+            msg.id === typingId
+              ? {
+                  ...msg,
+                  meta: { response: finalResponse!, request: { question } },
+                  content: buildSummary(question, finalResponse!),
+                }
+              : msg
+          );
+          return { ...conv, messages, title: buildTitle(messages) };
+        });
+      }
     } catch (error) {
       updateConversation(convoId, (conv) => {
         const messages = conv.messages.map((msg) =>
@@ -159,6 +178,7 @@ export default function App() {
       });
     } finally {
       setLoading(false);
+      setAgentProgress(null);
     }
   }, [activeId, appendTypingMessage, composerText, updateConversation]);
 
@@ -179,20 +199,38 @@ export default function App() {
         return { ...conv, messages };
       });
 
+      // Initialize progress tracking
+      setAgentProgress(createInitialProgress());
+
       try {
-        const response = await askQuestion(question);
-        updateConversation(activeId, (conv) => {
-          const messages = conv.messages.map((msg) =>
-            msg.id === messageId
-              ? {
-                  ...msg,
-                  meta: { response, request: { question } },
-                  content: buildSummary(question, response),
-                }
-              : msg
-          );
-          return { ...conv, messages, title: buildTitle(messages) };
-        });
+        let finalResponse: BackendResponse | null = null;
+
+        for await (const event of askQuestionStream(question)) {
+          if (event.type === "progress" && event.agent && event.status) {
+            setAgentProgress((prev) => 
+              prev ? { ...prev, [event.agent as AgentName]: event.status! } : prev
+            );
+          } else if (event.type === "result" && event.data) {
+            finalResponse = event.data;
+          } else if (event.type === "error") {
+            throw new Error(event.message || "Request failed");
+          }
+        }
+
+        if (finalResponse) {
+          updateConversation(activeId, (conv) => {
+            const messages = conv.messages.map((msg) =>
+              msg.id === messageId
+                ? {
+                    ...msg,
+                    meta: { response: finalResponse!, request: { question } },
+                    content: buildSummary(question, finalResponse!),
+                  }
+                : msg
+            );
+            return { ...conv, messages, title: buildTitle(messages) };
+          });
+        }
       } catch (error) {
         updateConversation(activeId, (conv) => {
           const messages = conv.messages.map((msg) =>
@@ -208,6 +246,7 @@ export default function App() {
         });
       } finally {
         setLoading(false);
+        setAgentProgress(null);
       }
     },
     [activeId, updateConversation]
@@ -232,6 +271,7 @@ export default function App() {
         <ChatWindow
           conversation={activeConversation}
           loading={loading}
+          agentProgress={agentProgress}
           onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           theme={theme}
           onToggleTheme={handleToggleTheme}

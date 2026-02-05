@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import type { Conversation } from "../types";
+import type { AgentProgress, Conversation } from "../types";
+import AgentProgressWidget from "./AgentProgressWidget";
 import Header from "./Header";
 import Message from "./Message";
 
 type ChatWindowProps = {
   conversation: Conversation | null;
   loading: boolean;
+  agentProgress: AgentProgress | null;
   onToggleSidebar: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
@@ -15,6 +17,7 @@ type ChatWindowProps = {
 export default function ChatWindow({
   conversation,
   loading,
+  agentProgress,
   onToggleSidebar,
   theme,
   onToggleTheme,
@@ -39,7 +42,7 @@ export default function ChatWindow({
     <div className="chat-window">
       <Header
         title={conversation?.title ?? "New chat"}
-        subtitle="Local conversations"
+        subtitle="Multi-Agent Research"
         theme={theme}
         onToggleTheme={onToggleTheme}
         onToggleSidebar={onToggleSidebar}
@@ -55,11 +58,25 @@ export default function ChatWindow({
                 onRetry={(id, question) => onRetry(id, question)}
               />
             ))}
+            {agentProgress && (
+              <div className="message-row assistant">
+                <div className="message-inner">
+                  <div className="avatar assistant">MA</div>
+                  <div className="bubble assistant">
+                    <AgentProgressWidget progress={agentProgress} />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <div className="empty-state">
-            <h1>Ask a research question</h1>
-            <p>Retrieve papers, extract evidence, critique quality, and synthesize a grounded answer.</p>
+            <div className="empty-logo">MA</div>
+            <h1>What would you like to research?</h1>
+            <p>
+              Ask any scientific or medical research question. I'll find relevant papers, 
+              extract key evidence, assess study quality, and synthesize a grounded answer with citations.
+            </p>
           </div>
         )}
       </div>

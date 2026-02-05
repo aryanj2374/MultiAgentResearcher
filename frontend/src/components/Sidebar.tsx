@@ -33,7 +33,7 @@ export default function Sidebar({
       </div>
 
       <button className="new-chat" onClick={onNewChat} type="button">
-        + New chat
+        New chat
       </button>
 
       <div className="conversation-list">
@@ -50,11 +50,7 @@ export default function Sidebar({
         ))}
       </div>
 
-      <div className="sidebar-footer">
-        <div className="footer-item">Settings</div>
-        <div className="footer-item">Profile</div>
-        <div className="footer-item">Help</div>
-      </div>
+
     </aside>
   );
 }

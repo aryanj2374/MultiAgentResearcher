@@ -83,3 +83,38 @@ export type BackendResponse = {
 };
 
 export type Theme = "dark" | "light";
+
+// Agent progress tracking types
+export type AgentStatus = "pending" | "running" | "completed" | "failed";
+
+export type AgentName = "retriever" | "extractor" | "critic" | "synthesizer" | "referee";
+
+export type AgentProgress = Record<AgentName, AgentStatus>;
+
+export type ProgressEvent = {
+  type: "progress" | "result" | "error";
+  agent?: AgentName;
+  status?: AgentStatus;
+  message?: string;
+  data?: BackendResponse;
+};
+
+export const AGENT_NAMES: AgentName[] = ["retriever", "extractor", "critic", "synthesizer", "referee"];
+
+export const AGENT_LABELS: Record<AgentName, string> = {
+  retriever: "Retriever",
+  extractor: "Extractor",
+  critic: "Critic",
+  synthesizer: "Synthesizer",
+  referee: "Referee",
+};
+
+export function createInitialProgress(): AgentProgress {
+  return {
+    retriever: "pending",
+    extractor: "pending",
+    critic: "pending",
+    synthesizer: "pending",
+    referee: "pending",
+  };
+}

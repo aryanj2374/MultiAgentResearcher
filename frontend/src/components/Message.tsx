@@ -13,6 +13,12 @@ function buildSummary(response: BackendResponse | undefined, content: string): s
   return content || "Summary unavailable.";
 }
 
+function getConfidenceLevel(score: number): { label: string; className: string } {
+  if (score >= 60) return { label: "High", className: "high" };
+  if (score >= 30) return { label: "Medium", className: "medium" };
+  return { label: "Low", className: "low" };
+}
+
 export default function Message({ message, onRetry }: MessageProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
@@ -35,33 +41,21 @@ export default function Message({ message, onRetry }: MessageProps) {
   };
 
   if (message.meta?.typing) {
-    return (
-      <div className="message-row assistant">
-        <div className="message-inner">
-          <div className="avatar">MA</div>
-          <div className="bubble assistant">
-            <div className="typing-dots">
-              <span />
-              <span />
-              <span />
-            </div>
-          </div>
-        </div>
-      </div>
-    );
+    // Progress widget is shown separately in ChatWindow
+    return null;
   }
 
   if (message.meta?.error) {
     return (
       <div className="message-row assistant">
         <div className="message-inner">
-          <div className="avatar">MA</div>
+          <div className="avatar assistant">MA</div>
           <div className="bubble assistant error-bubble">
-            <strong>Request failed.</strong>
-            <p>{message.meta.error}</p>
+            <strong>Request failed</strong>
+            <p className="error-text">{message.meta.error}</p>
             {message.meta.request?.question && (
               <button className="retry-btn" onClick={handleRetry} type="button">
-                Retry
+                ↻ Try again
               </button>
             )}
           </div>
@@ -74,16 +68,19 @@ export default function Message({ message, onRetry }: MessageProps) {
     return (
       <div className="message-row user">
         <div className="message-inner">
+          <div className="avatar user">You</div>
           <div className="bubble user">{message.content}</div>
         </div>
       </div>
     );
   }
 
+  const confidence = response ? getConfidenceLevel(response.synthesis.confidence_score) : null;
+
   return (
     <div className="message-row assistant">
       <div className="message-inner">
-        <div className="avatar">MA</div>
+        <div className="avatar assistant">MA</div>
         <div className="bubble assistant">
           <div className="bubble-header">
             <span className="timestamp">{new Date(message.createdAt).toLocaleTimeString()}</span>
@@ -94,10 +91,10 @@ export default function Message({ message, onRetry }: MessageProps) {
               {menuOpen && (
                 <div className="menu">
                   <button type="button" onClick={handleCopy}>
-                    Copy
+                    Copy response
                   </button>
-                  <button type="button" onClick={() => setShowRaw((prev) => !prev)}>
-                    {showRaw ? "Hide raw JSON" : "Show raw JSON"}
+                  <button type="button" onClick={() => { setShowRaw((prev) => !prev); setMenuOpen(false); }}>
+                    {showRaw ? "Hide JSON" : "Show JSON"}
                   </button>
                 </div>
               )}
@@ -108,8 +105,21 @@ export default function Message({ message, onRetry }: MessageProps) {
             <div className="assistant-content">
               <p>{summary}</p>
 
+              {confidence && (
+                <div className="confidence-row">
+                  <span className={`confidence-badge ${confidence.className}`}>
+                    Confidence: {response.synthesis.confidence_score}% ({confidence.label})
+                  </span>
+                  {response.papers.length > 0 && (
+                    <span className="confidence-meta">
+                      Based on {response.papers.length} paper{response.papers.length !== 1 ? "s" : ""}
+                    </span>
+                  )}
+                </div>
+              )}
+
               <section>
-                <h4>Answer</h4>
+                <h4>Key Findings</h4>
                 <ul>
                   {response.synthesis.final_answer.map((bullet, index) => (
                     <li key={index}>{bullet}</li>
@@ -117,53 +127,71 @@ export default function Message({ message, onRetry }: MessageProps) {
                 </ul>
               </section>
 
-              <section>
-                <h4>Evidence</h4>
-                <ul>
-                  {response.papers.map((paper) => (
-                    <li key={paper.paper_id}>
-                      <strong>{paper.title}</strong> — {paper.authors.join(", ")} {paper.year ?? ""}
-                      {paper.url && (
-                        <span>
-                          {" "}
-                          <a href={paper.url} target="_blank" rel="noreferrer">
-                            Link
-                          </a>
+              {response.papers.length > 0 && (
+                <section>
+                  <h4>Sources ({response.papers.length})</h4>
+                  <ul>
+                    {response.papers.map((paper) => (
+                      <li key={paper.paper_id}>
+                        <strong>{paper.title}</strong>
+                        <span className="paper-meta">
+                          — {paper.authors.slice(0, 2).join(", ")}{paper.authors.length > 2 ? " et al." : ""} {paper.year ?? ""}
                         </span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </section>
+                        {paper.url && (
+                          <a href={paper.url} target="_blank" rel="noreferrer" className="paper-link">
+                            View paper ↗
+                          </a>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
 
-              <Collapsible title="Evidence table">
-                <div className="table">
-                  <div className="table-row header">
-                    <div>Paper</div>
-                    <div>Study Type</div>
-                    <div>Effect</div>
-                    <div>Bias</div>
-                    <div>Limitations</div>
+              {response.extractions.length > 0 && (
+                <Collapsible title={`Evidence Table (${response.extractions.length} studies)`}>
+                  <div className="table">
+                    <div className="table-row header">
+                      <div>Paper</div>
+                      <div>Study Type</div>
+                      <div>Effect</div>
+                      <div>Bias Risk</div>
+                      <div>Key Finding</div>
+                    </div>
+                    {response.extractions.map((extraction) => {
+                      const critique = response.critiques.find((item) => item.paper_id === extraction.paper_id);
+                      const paper = response.papers.find((p) => p.paper_id === extraction.paper_id);
+                      return (
+                        <div className="table-row" key={extraction.paper_id}>
+                          <div>{paper?.title?.slice(0, 40) ?? extraction.paper_id.slice(0, 8)}...</div>
+                          <div>{extraction.study_type.replace("_", " ")}</div>
+                          <div>{extraction.effect_direction ?? "—"}</div>
+                          <div className={`risk ${critique?.risk_of_bias ?? "unknown"}`}>
+                            {critique?.risk_of_bias ?? "—"}
+                          </div>
+                          <div>{extraction.claim_summary.slice(0, 60)}...</div>
+                        </div>
+                      );
+                    })}
                   </div>
-                  {response.extractions.map((extraction) => {
-                    const critique = response.critiques.find((item) => item.paper_id === extraction.paper_id);
-                    return (
-                      <div className="table-row" key={extraction.paper_id}>
-                        <div>{extraction.paper_id.slice(0, 8)}</div>
-                        <div>{extraction.study_type}</div>
-                        <div>{extraction.effect_direction ?? "-"}</div>
-                        <div>{critique?.risk_of_bias ?? "-"}</div>
-                        <div>{extraction.limitations?.length ? extraction.limitations.join("; ") : "-"}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </Collapsible>
+                </Collapsible>
+              )}
 
-              <Collapsible title="Agent steps">
+              <Collapsible title="Pipeline Details">
+                <div className="agent-stepper">
+                  {["Retriever", "Extractor", "Critic", "Synthesizer", "Referee"].map((label, index, arr) => (
+                    <div className="agent-stepper-item" key={label}>
+                      <div className="agent-stepper-icon">
+                        <span className="agent-dot" />
+                        {index < arr.length - 1 && <span className="agent-line" />}
+                      </div>
+                      <div className="agent-stepper-label">{label}</div>
+                    </div>
+                  ))}
+                </div>
                 <div className="agent-steps">
                   {[
-                    { label: "Retriever", data: response.logs?.retrieve ?? response.papers },
+                    { label: "Retriever", data: response.logs?.retrieve ?? { papers: response.papers.length } },
                     { label: "Extractor", data: response.logs?.extract ?? response.extractions },
                     { label: "Critic", data: response.logs?.critique ?? response.critiques },
                     { label: "Synthesizer", data: response.logs?.synthesize ?? response.synthesis },
