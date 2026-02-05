@@ -1,413 +1,250 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import ChatWindow from "./components/ChatWindow";
+import Composer from "./components/Composer";
+import Sidebar from "./components/Sidebar";
+import { askQuestion } from "./lib/api";
+import { loadConversations, loadTheme, saveConversations, saveTheme } from "./lib/storage";
+import type { BackendResponse, Conversation, Message, Theme } from "./types";
 
-type Paper = {
-  paper_id: string;
-  title: string;
-  authors: string[];
-  year?: number | null;
-  venue?: string | null;
-  url?: string | null;
-  abstract?: string | null;
-};
-
-type StudyExtraction = {
-  paper_id: string;
-  claim_summary: string;
-  study_type: string;
-  population?: string | null;
-  sample_size?: number | null;
-  intervention_exposure?: string | null;
-  comparison?: string | null;
-  outcomes?: string | null;
-  effect_direction?: string | null;
-  effect_size_text?: string | null;
-  key_snippet: string;
-  limitations: string[];
-  apa_citation: string;
-  url?: string | null;
-};
-
-type Critique = {
-  paper_id: string;
-  risk_of_bias: string;
-  rationale: string[];
-  red_flags: string[];
-};
-
-type Synthesis = {
-  final_answer: string[];
-  evidence_consensus: string;
-  top_limitations_overall: string[];
-  confidence_score: number;
-  confidence_rationale: string[];
-  citations_used: string[];
-};
-
-type Verification = {
-  passed: boolean;
-  issues: string[];
-  revised_synthesis?: Synthesis | null;
-};
-
-type RunResponse = {
-  run_id: string;
-  question: string;
-  papers: Paper[];
-  extractions: StudyExtraction[];
-  critiques: Critique[];
-  synthesis: Synthesis;
-  verification: Verification;
-  logs?: Record<string, unknown> | null;
-};
-
-type TabKey = "final" | "evidence" | "logs";
-
-type StepStatus = "idle" | "running" | "done";
-
-type IconSpec = { paths: string[] };
-
-const icons: Record<string, IconSpec> = {
-  plus: { paths: ["M12 5v14", "M5 12h14"] },
-  search: {
-    paths: [
-      "M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16Z",
-      "M21 21l-4.3-4.3",
-    ],
-  },
-  chat: { paths: ["M4 6h16v10H7l-3 3V6Z"] },
-  retrieve: { paths: ["M4 7h16", "M4 12h10", "M4 17h6"] },
-  extract: { paths: ["M6 4h9l3 3v13H6z", "M9 12h6", "M9 16h6"] },
-  critique: { paths: ["M12 5l7 12H5l7-12Z", "M12 10v3", "M12 16h.01"] },
-  synthesize: { paths: ["M5 12h14", "M12 5v14", "M7 7l10 10"] },
-  verify: { paths: ["M6 12l4 4 8-8"] },
-  answer: { paths: ["M5 6h14", "M5 12h10", "M5 18h7"] },
-  table: { paths: ["M4 7h16", "M4 12h16", "M4 17h16", "M10 7v10"] },
-  logs: { paths: ["M6 6h12", "M6 12h12", "M6 18h8"] },
-  send: { paths: ["M4 12l16-7-4 7 4 7-16-7Z"] },
-};
-
-const stepItems = [
-  { key: "Retrieve", icon: "retrieve" },
-  { key: "Extract", icon: "extract" },
-  { key: "Critique", icon: "critique" },
-  { key: "Synthesize", icon: "synthesize" },
-  { key: "Verify", icon: "verify" },
-];
-
-const tabItems: Array<{ key: TabKey; label: string; icon: string }> = [
-  { key: "final", label: "Answer", icon: "answer" },
-  { key: "evidence", label: "Evidence", icon: "table" },
-  { key: "logs", label: "Logs", icon: "logs" },
-];
-
-function Icon({ name, size = 18 }: { name: string; size?: number }) {
-  const spec = icons[name];
-  return (
-    <svg
-      className="icon"
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.7"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      {spec.paths.map((path, index) => (
-        <path key={index} d={path} />
-      ))}
-    </svg>
-  );
+function createId() {
+  return crypto.randomUUID();
 }
 
-function App() {
-  const [question, setQuestion] = useState("");
-  const [runs, setRuns] = useState<RunResponse[]>([]);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+function now() {
+  return new Date().toISOString();
+}
+
+function buildTitle(messages: Message[]): string {
+  const firstUser = messages.find((msg) => msg.role === "user");
+  if (!firstUser) return "New chat";
+  return firstUser.content.slice(0, 56);
+}
+
+function buildSummary(content: string, response?: BackendResponse): string {
+  if (response?.synthesis?.evidence_consensus) return response.synthesis.evidence_consensus;
+  if (response?.synthesis?.final_answer?.length) return response.synthesis.final_answer[0];
+  return content;
+}
+
+export default function App() {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<TabKey>("final");
+  const [composerText, setComposerText] = useState("");
+  const [theme, setTheme] = useState<Theme>("dark");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
-  const activeRun = runs.find((run) => run.run_id === activeRunId) ?? runs[0] ?? null;
-  const stepStatus: StepStatus = loading ? "running" : activeRun ? "done" : "idle";
+  useEffect(() => {
+    const stored = loadConversations();
+    setConversations(stored);
+    if (stored[0]) setActiveId(stored[0].id);
+    const storedTheme = loadTheme();
+    if (storedTheme) setTheme(storedTheme);
+  }, []);
 
-  const extractionById = useMemo(() => {
-    const map = new Map<string, StudyExtraction>();
-    activeRun?.extractions.forEach((item) => map.set(item.paper_id, item));
-    return map;
-  }, [activeRun]);
+  useEffect(() => {
+    saveConversations(conversations);
+  }, [conversations]);
 
-  const critiqueById = useMemo(() => {
-    const map = new Map<string, Critique>();
-    activeRun?.critiques.forEach((item) => map.set(item.paper_id, item));
-    return map;
-  }, [activeRun]);
+  useEffect(() => {
+    saveTheme(theme);
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
-  const handleRun = async () => {
-    if (!question.trim()) {
-      setError("Please enter a research question.");
-      return;
+  const activeConversation = useMemo(
+    () => conversations.find((conv) => conv.id === activeId) ?? null,
+    [conversations, activeId]
+  );
+
+  const updateConversation = useCallback(
+    (id: string, updater: (conv: Conversation) => Conversation) => {
+      setConversations((prev) => prev.map((conv) => (conv.id === id ? updater(conv) : conv)));
+    },
+    []
+  );
+
+  const handleNewChat = useCallback(() => {
+    const convo: Conversation = {
+      id: createId(),
+      title: "New chat",
+      createdAt: now(),
+      messages: [],
+    };
+    setConversations((prev) => [convo, ...prev]);
+    setActiveId(convo.id);
+  }, []);
+
+  const handleSelectConversation = useCallback((id: string) => {
+    setActiveId(id);
+    setSidebarOpen(false);
+  }, []);
+
+  const appendTypingMessage = useCallback((convoId: string, question: string) => {
+    const typingMessage: Message = {
+      id: createId(),
+      role: "assistant",
+      content: "",
+      createdAt: now(),
+      meta: { typing: true, request: { question } },
+    };
+
+    updateConversation(convoId, (conv) => {
+      const messages = [...conv.messages, typingMessage];
+      return { ...conv, messages, title: buildTitle(messages) };
+    });
+
+    return typingMessage.id;
+  }, [updateConversation]);
+
+  const handleSend = useCallback(async () => {
+    if (!composerText.trim()) return;
+
+    let convoId = activeId;
+    if (!convoId) {
+      const convo: Conversation = {
+        id: createId(),
+        title: "New chat",
+        createdAt: now(),
+        messages: [],
+      };
+      setConversations((prev) => [convo, ...prev]);
+      convoId = convo.id;
+      setActiveId(convo.id);
     }
+
+    const question = composerText.trim();
+    const userMessage: Message = {
+      id: createId(),
+      role: "user",
+      content: question,
+      createdAt: now(),
+    };
+
+    setComposerText("");
     setLoading(true);
-    setError(null);
-    setPendingQuestion(question);
-    setActiveTab("final");
+
+    updateConversation(convoId, (conv) => {
+      const messages = [...conv.messages, userMessage];
+      return { ...conv, messages, title: buildTitle(messages) };
+    });
+
+    const typingId = appendTypingMessage(convoId, question);
 
     try {
-      const res = await fetch("/api/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+      const response = await askQuestion(question);
+      updateConversation(convoId, (conv) => {
+        const messages = conv.messages.map((msg) =>
+          msg.id === typingId
+            ? {
+                ...msg,
+                meta: { response, request: { question } },
+                content: buildSummary(question, response),
+              }
+            : msg
+        );
+        return { ...conv, messages, title: buildTitle(messages) };
       });
-
-      if (!res.ok) {
-        const payload = await res.json().catch(() => null);
-        const detail = payload?.detail ?? "Request failed";
-        throw new Error(detail);
-      }
-
-      const data: RunResponse = await res.json();
-      setRuns((prev) => [data, ...prev]);
-      setActiveRunId(data.run_id);
-      setQuestion("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unexpected error");
+    } catch (error) {
+      updateConversation(convoId, (conv) => {
+        const messages = conv.messages.map((msg) =>
+          msg.id === typingId
+            ? {
+                ...msg,
+                meta: { error: error instanceof Error ? error.message : "Request failed", request: { question } },
+                content: "",
+              }
+            : msg
+        );
+        return { ...conv, messages, title: buildTitle(messages) };
+      });
     } finally {
       setLoading(false);
-      setPendingQuestion(null);
     }
-  };
+  }, [activeId, appendTypingMessage, composerText, updateConversation]);
 
-  const handleSelectRun = (runId: string) => {
-    setActiveRunId(runId);
-    setActiveTab("final");
-  };
+  const handleRetry = useCallback(
+    async (messageId: string, question: string) => {
+      if (!activeId) return;
+      setLoading(true);
+      updateConversation(activeId, (conv) => {
+        const messages = conv.messages.map((msg) =>
+          msg.id === messageId
+            ? {
+                ...msg,
+                meta: { typing: true, request: { question } },
+                content: "",
+              }
+            : msg
+        );
+        return { ...conv, messages };
+      });
 
-  const handleNewChat = () => {
-    setActiveRunId(null);
-    setPendingQuestion(null);
-    setError(null);
-    setActiveTab("final");
-  };
+      try {
+        const response = await askQuestion(question);
+        updateConversation(activeId, (conv) => {
+          const messages = conv.messages.map((msg) =>
+            msg.id === messageId
+              ? {
+                  ...msg,
+                  meta: { response, request: { question } },
+                  content: buildSummary(question, response),
+                }
+              : msg
+          );
+          return { ...conv, messages, title: buildTitle(messages) };
+        });
+      } catch (error) {
+        updateConversation(activeId, (conv) => {
+          const messages = conv.messages.map((msg) =>
+            msg.id === messageId
+              ? {
+                  ...msg,
+                  meta: { error: error instanceof Error ? error.message : "Request failed", request: { question } },
+                  content: "",
+                }
+              : msg
+          );
+          return { ...conv, messages };
+        });
+      } finally {
+        setLoading(false);
+      }
+    },
+    [activeId, updateConversation]
+  );
+
+  const handleToggleTheme = useCallback(() => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  }, []);
 
   return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="logo">MA</div>
-          <div>
-            <p className="brand-title">Multi-Agent Research</p>
-            <p className="brand-subtitle">Scientific Assistant</p>
-          </div>
+    <div className="app-shell">
+      <Sidebar
+        conversations={conversations}
+        activeId={activeId}
+        collapsed={!sidebarOpen}
+        onSelect={handleSelectConversation}
+        onNewChat={handleNewChat}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      <div className="main">
+        <ChatWindow
+          conversation={activeConversation}
+          loading={loading}
+          onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
+          theme={theme}
+          onToggleTheme={handleToggleTheme}
+          onRetry={handleRetry}
+        />
+
+        <div className="composer-wrapper">
+          <Composer value={composerText} loading={loading} onChange={setComposerText} onSend={handleSend} />
+          <p className="composer-footer">Responses may be inaccurate. Verify critical details.</p>
         </div>
+      </div>
 
-        <div className="sidebar-actions">
-          <button className="icon-row" onClick={handleNewChat} type="button">
-            <Icon name="plus" />
-            <span>New chat</span>
-          </button>
-          <button className="icon-row muted" type="button" aria-disabled="true">
-            <Icon name="search" />
-            <span>Search</span>
-          </button>
-        </div>
-
-        <div className="history">
-          <p className="section-title">History</p>
-          {runs.length === 0 && <p className="muted">No runs yet.</p>}
-          <ul>
-            {runs.map((run) => (
-              <li key={run.run_id}>
-                <button
-                  className={`history-item ${run.run_id === activeRun?.run_id ? "active" : ""}`}
-                  onClick={() => handleSelectRun(run.run_id)}
-                >
-                  <Icon name="chat" />
-                  <span>{run.question}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      </aside>
-
-      <main className="chat">
-        <header className="topbar">
-          <div className="topbar-left">
-            <p className="topbar-title">Research Workspace</p>
-            <span className="topbar-pill">HF · Multi-Agent</span>
-          </div>
-          <div className="topbar-right">
-            <span className={`status ${loading ? "running" : "idle"}`}></span>
-          </div>
-        </header>
-
-        <div className="chat-scroll">
-          {!activeRun && !pendingQuestion && (
-            <div className="empty-state">
-              <h1>What are you investigating today?</h1>
-              <p>Ask a scientific question and get a citation‑grounded synthesis.</p>
-            </div>
-          )}
-
-          {(pendingQuestion || activeRun) && (
-            <div className="thread">
-              <div className="message user">
-                <div className="bubble">{pendingQuestion ?? activeRun?.question}</div>
-              </div>
-
-              <div className="message assistant">
-                <div className="bubble">
-                  <div className="pipeline" aria-label="Pipeline stages">
-                    {stepItems.map((step) => (
-                      <div key={step.key} className={`pipeline-step ${stepStatus}`} title={step.key}>
-                        <Icon name={step.icon} />
-                      </div>
-                    ))}
-                  </div>
-
-                  {loading && <p className="muted">Agents are working. This usually takes under a minute.</p>}
-
-                  {activeRun && (
-                    <>
-                      <div className="tabs">
-                        {tabItems.map((tab) => (
-                          <button
-                            key={tab.key}
-                            className={activeTab === tab.key ? "active" : ""}
-                            onClick={() => setActiveTab(tab.key)}
-                          >
-                            <Icon name={tab.icon} />
-                            <span>{tab.label}</span>
-                          </button>
-                        ))}
-                      </div>
-
-                      {activeTab === "final" && (
-                        <div className="final-answer">
-                          <h2>Final Answer</h2>
-                          <ul>
-                            {activeRun.synthesis.final_answer.map((bullet, index) => (
-                              <li key={index}>{bullet}</li>
-                            ))}
-                          </ul>
-
-                          <h3>Evidence Consensus</h3>
-                          <p>{activeRun.synthesis.evidence_consensus}</p>
-
-                          <div className="grid-two">
-                            <div>
-                              <h3>Top Limitations</h3>
-                              <ul>
-                                {activeRun.synthesis.top_limitations_overall.map((item, index) => (
-                                  <li key={index}>{item}</li>
-                                ))}
-                              </ul>
-                            </div>
-                            <div>
-                              <h3>Confidence</h3>
-                              <p className="confidence">{activeRun.synthesis.confidence_score}/100</p>
-                              <ul>
-                                {activeRun.synthesis.confidence_rationale.map((item, index) => (
-                                  <li key={index}>{item}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          </div>
-
-                          {!activeRun.verification.passed && activeRun.verification.issues.length > 0 && (
-                            <div className="callout">
-                              <h3>Verification Issues</h3>
-                              <ul>
-                                {activeRun.verification.issues.map((issue, index) => (
-                                  <li key={index}>{issue}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {activeTab === "evidence" && (
-                        <div className="evidence">
-                          <h2>Evidence Table</h2>
-                          <div className="table">
-                            <div className="table-row header">
-                              <div>Paper</div>
-                              <div>Study Type</div>
-                              <div>Sample Size</div>
-                              <div>Effect</div>
-                              <div>Bias</div>
-                            </div>
-                            {activeRun.papers.map((paper) => {
-                              const extraction = extractionById.get(paper.paper_id);
-                              const critique = critiqueById.get(paper.paper_id);
-                              return (
-                                <div className="table-row" key={paper.paper_id}>
-                                  <div>
-                                    <p className="paper-title">{paper.title}</p>
-                                    <p className="paper-meta">
-                                      {paper.authors.slice(0, 2).join(", ")}
-                                      {paper.authors.length > 2 ? " et al." : ""} {paper.year ?? ""}
-                                    </p>
-                                    {paper.url && (
-                                      <a href={paper.url} target="_blank" rel="noreferrer">
-                                        View paper
-                                      </a>
-                                    )}
-                                    {extraction && <p className="paper-claim">{extraction.claim_summary}</p>}
-                                  </div>
-                                  <div>{extraction?.study_type ?? "-"}</div>
-                                  <div>{extraction?.sample_size ?? "-"}</div>
-                                  <div>{extraction?.effect_direction ?? "-"}</div>
-                                  <div className={`bias ${critique?.risk_of_bias ?? "unknown"}`}>
-                                    {critique?.risk_of_bias ?? "unknown"}
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-
-                      {activeTab === "logs" && (
-                        <div className="logs">
-                          <h2>Agent Logs</h2>
-                          <pre>{JSON.stringify(activeRun.logs ?? activeRun, null, 2)}</pre>
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="input-bar">
-          <div className="input-wrapper">
-            <button className="icon-button" type="button" aria-label="Add context">
-              <Icon name="plus" />
-            </button>
-            <textarea
-              placeholder="Ask a research question"
-              value={question}
-              onChange={(event) => setQuestion(event.target.value)}
-              rows={2}
-            />
-            <button className="send" onClick={handleRun} disabled={loading}>
-              <Icon name="send" />
-              <span>{loading ? "Running" : "Send"}</span>
-            </button>
-          </div>
-          {error && <p className="error">{error}</p>}
-        </div>
-      </main>
+      {sidebarOpen && <div className="overlay" onClick={() => setSidebarOpen(false)} />}
     </div>
   );
 }
-
-export default App;
