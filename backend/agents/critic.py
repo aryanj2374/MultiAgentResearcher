@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import List
 
@@ -9,6 +10,9 @@ from utils import safe_json_loads
 
 CRITIC_SYSTEM = """You assess study quality and risk of bias from limited metadata.
 Return ONLY valid JSON matching the schema. No commentary."""
+
+# Maximum concurrent LLM requests to stay within rate limits
+MAX_CONCURRENT_CRITIQUES = 5
 
 
 def _fallback_critique(extraction: StudyExtraction) -> Critique:
@@ -56,6 +60,7 @@ async def critique_all(
     extractions: List[StudyExtraction],
     llm: ChatLLM,
 ) -> List[Critique]:
+    """Critique all extractions sequentially."""
     paper_lookup = {p.paper_id: p for p in papers}
     results: List[Critique] = []
 
@@ -74,3 +79,4 @@ async def critique_all(
             results.append(_fallback_critique(extraction))
 
     return results
+

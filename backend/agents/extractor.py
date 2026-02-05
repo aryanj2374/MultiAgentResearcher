@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import List
@@ -126,10 +127,69 @@ def _detect_effect_direction(text: str) -> str:
     return "unclear"
 
 
+def _extract_key_findings_from_abstract(abstract: str) -> str | None:
+    """Extract the most informative sentence from an abstract focusing on findings/conclusions."""
+    if not abstract or len(abstract) < 50:
+        return None
+    
+    # Split into sentences
+    sentences = []
+    for sep in [". ", ".\n"]:
+        if sep in abstract:
+            parts = abstract.split(sep)
+            sentences = [s.strip() + "." for s in parts if s.strip()]
+            break
+    
+    if not sentences:
+        sentences = [abstract.strip()]
+    
+    # Prioritize sentences with findings/results keywords
+    findings_keywords = [
+        "found that", "showed that", "demonstrated", "revealed", "indicates",
+        "results suggest", "findings", "concluded", "evidence suggests",
+        "significantly", "improved", "reduced", "increased", "enhanced",
+        "effect", "associated with", "correlated", "relationship",
+    ]
+    
+    for sentence in sentences:
+        sentence_lower = sentence.lower()
+        if any(kw in sentence_lower for kw in findings_keywords):
+            # Found a findings sentence
+            if len(sentence) > 200:
+                # Truncate long sentences
+                return sentence[:200].rsplit(" ", 1)[0] + "..."
+            return sentence
+    
+    # If no findings sentence, try to find a conclusion-like sentence (often near end)
+    for sentence in reversed(sentences[-3:]):
+        if len(sentence) > 30 and not sentence.lower().startswith(("background", "introduction", "purpose", "objective", "aim")):
+            if len(sentence) > 200:
+                return sentence[:200].rsplit(" ", 1)[0] + "..."
+            return sentence
+    
+    # Return the longest informative sentence
+    best = max(sentences, key=len) if sentences else None
+    if best and len(best) > 200:
+        return best[:200].rsplit(" ", 1)[0] + "..."
+    return best
+
+
 def _fallback_extract(paper: Paper) -> StudyExtraction:
     abstract = paper.abstract or ""
-    summary = first_sentence(abstract) or paper.title or "No abstract available."
     abstract_lower = abstract.lower()
+    
+    # Try to extract a meaningful finding from the abstract
+    summary = _extract_key_findings_from_abstract(abstract)
+    
+    # If still no good summary, use first sentence but mark it
+    if not summary:
+        first = first_sentence(abstract)
+        if first and len(first) > 20:
+            summary = first
+        else:
+            # Last resort: use title but prefix it clearly
+            summary = f"Study examining: {paper.title}" if paper.title else "No abstract available."
+    
     if "meta-analysis" in abstract_lower or "meta analysis" in abstract_lower:
         study_type = "meta_analysis"
     elif "systematic review" in abstract_lower:
@@ -193,6 +253,7 @@ def _build_prompt(paper: Paper) -> str:
 
 
 async def extract_all(papers: List[Paper], llm: ChatLLM) -> List[StudyExtraction]:
+    """Extract study information from papers sequentially."""
     results: List[StudyExtraction] = []
 
     for paper in papers:
