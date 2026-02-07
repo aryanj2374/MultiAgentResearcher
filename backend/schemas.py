@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Paper(BaseModel):
@@ -69,6 +69,14 @@ class Synthesis(BaseModel):
     confidence_score: int = Field(ge=0, le=100)
     confidence_rationale: list[str]
     citations_used: list[str]
+    
+    @field_validator("final_answer", "top_limitations_overall", "confidence_rationale", "citations_used", mode="before")
+    @classmethod
+    def coerce_to_list(cls, v):
+        """Coerce string values to single-item lists to handle LLM response format variations."""
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 class Verification(BaseModel):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, HTTPException
@@ -10,6 +11,12 @@ from fastapi.responses import StreamingResponse
 
 from orchestrator import run_question, run_question_with_progress
 from schemas import AskRequest, RunResponse
+
+# Configure logging to see agent diagnostics
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 app = FastAPI(title="Multi-Agent Scientific Research Assistant")
 
