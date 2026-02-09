@@ -2,7 +2,7 @@
 
 A powerful research assistant that uses a multi-agent AI pipeline to answer scientific questions. It retrieves papers from Semantic Scholar, analyzes them using LLMs, and synthesizes evidence-based answers with citations, confidence scores, and bias assessments.
 
-## ✨ Key Features
+## Key Features
 
 - **Deep Research Mode**: Automatically breaks down complex questions into sub-questions and researches them in parallel.
 - **Multi-Agent Pipeline**:
@@ -44,7 +44,7 @@ graph TD
     Referee --> UI[Frontend UI]
 ```
 
-## 🛠️ Setup
+## Setup
 
 ### 1. Backend
 
@@ -75,20 +75,20 @@ npm install
 npm run dev
 ```
 
-## 🚀 Usage
+## Usage
 
 1. Open `http://localhost:5173`
 2. Ask a research question (e.g., *"Does mindfulness meditation improve sleep quality?"*)
 3. Watch the agents plan, retrieve, extract, and synthesize.
 4. Review the final answer, confidence score, and evidence table.
 
-## 🧠 Agent details
+## Agent details
 
 - **Planner**: Uses heuristics and LLM to decide if a question needs decomposition.
 - **Extractor**: Extracts structured data (N, population, effect size) from abstracts using keyword pattern matching and LLM refinement.
 - **Synthesizer**: Weighs evidence (Meta-analysis > RCT) and synthesizes findings into themes, prioritizing a direct answer to the user's question.
 
-## ⚠️ Limitations
+## Limitations
 
 - Analysis is primarily abstract-based (full-text analysis is a future goal).
 - "Deep Research" mode can take longer (30-60s) but provides more comprehensive coverage.
