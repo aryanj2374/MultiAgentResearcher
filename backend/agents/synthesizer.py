@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import List
 
-from llm import ChatLLM, LLMRequestError, LLMUnavailableError
-from schemas import Critique, Paper, StudyExtraction, Synthesis
-from utils import citation_label, safe_json_loads
+from ..llm import ChatLLM, LLMRequestError, LLMUnavailableError
+from ..schemas import Critique, Paper, StudyExtraction, Synthesis
+from ..utils import build_citation_map, safe_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ SYNTHESIS GUIDELINES:
 CITATION REQUIREMENTS:
 - Every bullet point MUST include at least one inline citation like [AuthorYear].
 - When multiple studies agree, cite all: [Smith2020, Jones2021].
+- evidence_consensus MUST include at least one inline citation.
+- citations_used MUST contain exactly the paper_ids referenced by inline citations.
 
 OUTPUT FORMAT:
 - final_answer: 5-8 bullet points. FIRST bullet = direct answer to question. Remaining bullets = supporting evidence, nuances, and specific findings.
@@ -47,11 +50,34 @@ Return ONLY valid JSON matching the schema."""
 
 
 def _build_citation_map(papers: List[Paper]) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    for paper in papers:
-        label = citation_label(paper.authors, paper.year)
-        mapping[paper.paper_id] = label
-    return mapping
+    return build_citation_map(papers)
+
+
+def _citation_text(
+    extractions: List[StudyExtraction], citation_map: dict[str, str], limit: int = 4
+) -> str:
+    labels = list(
+        dict.fromkeys(
+            citation_map[extraction.paper_id]
+            for extraction in extractions
+            if extraction.paper_id in citation_map
+        )
+    )[:limit]
+    return f"[{', '.join(labels)}]" if labels else ""
+
+
+def _cited_paper_ids(
+    texts: List[str], papers: List[Paper], citation_map: dict[str, str]
+) -> List[str]:
+    used_labels: set[str] = set()
+    for text in texts:
+        for group in re.findall(r"\[([^\]]+)\]", text):
+            used_labels.update(part.strip() for part in group.split(","))
+    return [
+        paper.paper_id
+        for paper in papers
+        if citation_map.get(paper.paper_id) in used_labels
+    ]
 
 
 def _no_evidence_synthesis(question: str) -> Synthesis:
@@ -83,12 +109,11 @@ def _detect_comparison_question(question: str) -> tuple[str | None, str | None]:
     """Detect if the question compares two treatments/interventions and extract them."""
     q_lower = question.lower()
     comparison_patterns = [
-        (r"is\s+(.+?)\s+(?:more|less|better|worse)\s+(?:effective|beneficial)?\s*than\s+(.+?)[\s?]", True),
-        (r"(.+?)\s+(?:vs\.?|versus|compared to|or)\s+(.+?)[\s?]", True),
-        (r"does\s+(.+?)\s+outperform\s+(.+)", True),
+        r"^is\s+(.+?)\s+(?:more|less|better|worse)\s+(?:effective|beneficial)?\s*than\s+(.+?)\??$",
+        r"^(.+?)\s+(?:vs\.?|versus|compared to)\s+(.+?)\??$",
+        r"^does\s+(.+?)\s+outperform\s+(.+?)\??$",
     ]
-    import re
-    for pattern, is_comparison in comparison_patterns:
+    for pattern in comparison_patterns:
         match = re.search(pattern, q_lower)
         if match:
             return match.group(1).strip(), match.group(2).strip()
@@ -107,6 +132,7 @@ def _weight_by_study_quality(extractions: List[StudyExtraction]) -> dict:
     }
     weighted_positive = 0.0
     weighted_negative = 0.0
+    weighted_null = 0.0
     weighted_mixed = 0.0
     total_weight = 0.0
     
@@ -117,12 +143,15 @@ def _weight_by_study_quality(extractions: List[StudyExtraction]) -> dict:
             weighted_positive += w
         elif e.effect_direction == "negative":
             weighted_negative += w
+        elif e.effect_direction == "null":
+            weighted_null += w
         else:
             weighted_mixed += w
     
     return {
         "positive": weighted_positive,
         "negative": weighted_negative,
+        "null": weighted_null,
         "mixed": weighted_mixed,
         "total": total_weight,
     }
@@ -143,15 +172,18 @@ def _generate_direct_answer(
     # Count high-quality studies
     high_quality = [e for e in extractions if e.study_type in ("meta_analysis", "systematic_review", "RCT")]
     hq_positive = [e for e in high_quality if e.effect_direction == "positive"]
-    hq_negative = [e for e in high_quality if e.effect_direction == "negative"]
+    hq_negative = [e for e in high_quality if e.effect_direction in ("negative", "null")]
     
     # Generate answer based on weighted evidence
     pos_pct = (weighted["positive"] / weighted["total"] * 100) if weighted["total"] > 0 else 0
-    neg_pct = (weighted["negative"] / weighted["total"] * 100) if weighted["total"] > 0 else 0
+    neg_pct = (
+        (weighted["negative"] + weighted["null"]) / weighted["total"] * 100
+        if weighted["total"] > 0
+        else 0
+    )
     
     # Build citation list for the answer
-    all_labels = [citation_map.get(e.paper_id, "Unknown") for e in extractions[:4]]
-    citation_str = f"[{', '.join(all_labels)}]"
+    citation_str = _citation_text(extractions, citation_map)
     
     if item1 and item2:
         # Comparison question - provide comparative answer
@@ -245,7 +277,19 @@ def _fallback_synthesis(
         return _no_evidence_synthesis(question)
     
     citation_map = _build_citation_map(papers)
-    citations_used: List[str] = [e.paper_id for e in extractions]
+    if not extractions:
+        labels = list(citation_map.values())[:4]
+        citation = f"[{', '.join(labels)}]"
+        return Synthesis(
+            final_answer=[
+                f"Papers were retrieved, but no study evidence could be extracted reliably. {citation}"
+            ],
+            evidence_consensus=f"No evidence consensus can be calculated from the extracted data. {citation}",
+            top_limitations_overall=["Evidence extraction failed for all retrieved papers."],
+            confidence_score=0,
+            confidence_rationale=["No structured findings were available for synthesis."],
+            citations_used=list(citation_map.keys())[:4],
+        )
     
     # Analyze effect directions across studies
     positive_studies = []
@@ -257,12 +301,11 @@ def _fallback_synthesis(
         entry = {"label": label, "extraction": extraction}
         if extraction.effect_direction == "positive":
             positive_studies.append(entry)
-        elif extraction.effect_direction == "negative":
+        elif extraction.effect_direction in ("negative", "null"):
             negative_studies.append(entry)
         else:
             mixed_null_studies.append(entry)
     
-    total = len(extractions)
     pos_count = len(positive_studies)
     neg_count = len(negative_studies)
     
@@ -288,11 +331,20 @@ def _fallback_synthesis(
     sample_sizes = [e.sample_size for e in extractions if e.sample_size]
     if sample_sizes and sum(sample_sizes) > 500:
         total_n = sum(sample_sizes)
-        bullets.append(f"**Sample coverage**: Combined N = {total_n:,} participants across {len(sample_sizes)} studies with reported sample sizes.")
+        sampled = [e for e in extractions if e.sample_size]
+        bullets.append(
+            f"**Sample coverage**: Combined N = {total_n:,} participants across "
+            f"{len(sample_sizes)} studies with reported sample sizes. "
+            f"{_citation_text(sampled, citation_map)}"
+        )
     
     # 5. Note key limitations affecting conclusions
     if pos_count > 0 and neg_count > 0:
-        bullets.append(f"**Important caveat**: Evidence is conflicting ({pos_count} positive vs {neg_count} negative/null studies), suggesting individual variation or methodological differences.")
+        bullets.append(
+            f"**Important caveat**: Evidence is conflicting ({pos_count} positive vs "
+            f"{neg_count} negative/null studies), suggesting individual variation or "
+            f"methodological differences. {_citation_text(extractions, citation_map)}"
+        )
 
     # Build consensus statement
     weighted = _weight_by_study_quality(extractions)
@@ -306,6 +358,10 @@ def _fallback_synthesis(
         evidence_consensus = f"Limited consensus: Studies are divided ({pos_count} positive, {neg_count} negative/null), indicating the effect may be context-dependent."
     else:
         evidence_consensus = "Weak consensus: Most studies show unclear, mixed, or null effects. More rigorous research is needed."
+
+    evidence_consensus = (
+        f"{evidence_consensus} {_citation_text(extractions, citation_map)}".strip()
+    )
     
     # Build limitations - focus on synthesis-level issues
     limitations = []
@@ -360,7 +416,9 @@ def _fallback_synthesis(
         top_limitations_overall=limitations,
         confidence_score=score,
         confidence_rationale=rationale,
-        citations_used=citations_used,
+        citations_used=_cited_paper_ids(
+            bullets[:8] + [evidence_consensus], papers, citation_map
+        ),
     )
 
 
@@ -423,7 +481,8 @@ def _build_prompt(
         "",
         "Return a JSON object with: final_answer (list of 5-8 insightful bullets with citations), "
         "evidence_consensus (1-2 sentences on agreement level), top_limitations_overall (list of key weaknesses), "
-        "confidence_score (0-100), confidence_rationale (list explaining score), citations_used (list of paper_ids).",
+        "confidence_score (0-100), confidence_rationale (list explaining score), citations_used "
+        "(exact list of paper_ids referenced by inline citations).",
         "",
         "IMPORTANT: Return ONLY valid JSON, no other text."
     ])
@@ -471,4 +530,3 @@ async def synthesize(
     except Exception as e:
         logger.error(f"Synthesizer unexpected error: {type(e).__name__}: {e}")
         return _fallback_synthesis(question, papers, extractions, critiques)
-

@@ -3,22 +3,23 @@ from __future__ import annotations
 import re
 from typing import List
 
-from schemas import Critique, Paper, Synthesis, Verification
-from utils import citation_label
+from ..schemas import Critique, Paper, Synthesis, Verification
+from ..utils import build_citation_map
 
 
 def _citation_map(papers: List[Paper]) -> dict[str, str]:
-    mapping = {}
-    for paper in papers:
-        mapping[citation_label(paper.authors, paper.year)] = paper.paper_id
-    return mapping
+    return {label: paper_id for paper_id, label in build_citation_map(papers).items()}
 
 
 def _extract_citations(text: str) -> List[str]:
     found = []
     for group in re.findall(r"\[(.*?)\]", text or ""):
         parts = [part.strip() for part in group.split(",") if part.strip()]
-        found.extend(parts)
+        found.extend(
+            part
+            for part in parts
+            if re.match(r"^\S+(?:\d{4}|n\.d\.)(?:[a-z]|-\d+)?$", part)
+        )
     return found
 
 
@@ -31,7 +32,7 @@ def verify_synthesis(
     if not papers:
         return Verification(
             passed=True,
-            issues=["Note: No papers were retrieved, so citation verification was skipped."],
+            issues=[],
             revised_synthesis=None,
         )
     
@@ -53,23 +54,18 @@ def verify_synthesis(
 
     check_text("evidence_consensus", synthesis.evidence_consensus)
 
-    for idx, bullet in enumerate(synthesis.top_limitations_overall, start=1):
-        check_text(f"top_limitations_overall bullet {idx}", bullet)
-
-    for idx, bullet in enumerate(synthesis.confidence_rationale, start=1):
-        check_text(f"confidence_rationale bullet {idx}", bullet)
-
     used_labels = set()
     for section in (
         synthesis.final_answer
         + [synthesis.evidence_consensus]
-        + synthesis.top_limitations_overall
-        + synthesis.confidence_rationale
     ):
         used_labels.update(_extract_citations(section))
 
     mapped_paper_ids = {citation_map[label] for label in used_labels if label in citation_map}
-    if mapped_paper_ids and set(synthesis.citations_used) != mapped_paper_ids:
+    unknown_paper_ids = set(synthesis.citations_used) - {paper.paper_id for paper in papers}
+    if unknown_paper_ids:
+        issues.append("citations_used contains unknown paper ids.")
+    if set(synthesis.citations_used) != mapped_paper_ids:
         issues.append("citations_used does not match the citations referenced in text.")
 
     high_bias = sum(1 for c in critiques if c.risk_of_bias == "high")
@@ -77,4 +73,3 @@ def verify_synthesis(
         issues.append("Confidence score is high despite high risk-of-bias studies.")
 
     return Verification(passed=len(issues) == 0, issues=issues, revised_synthesis=None)
-

@@ -5,9 +5,9 @@ import json
 import re
 from typing import List
 
-from llm import ChatLLM, LLMRequestError, LLMUnavailableError
-from schemas import Paper, StudyExtraction
-from utils import first_sentence, safe_json_loads
+from ..llm import ChatLLM, LLMRequestError, LLMUnavailableError
+from ..schemas import Paper, StudyExtraction
+from ..utils import first_sentence, safe_json_loads
 
 EXTRACTOR_SYSTEM = """You extract structured study evidence from paper metadata and abstract.
 Return ONLY valid JSON matching the schema. No commentary.
@@ -22,18 +22,19 @@ def _limit_words(text: str, max_words: int = 25) -> str:
 def _extract_sample_size(text: str) -> int | None:
     if not text:
         return None
+    count = r"(\d{1,3}(?:,\d{3})*|\d{1,7})"
     patterns = [
-        r"\b[Nn]\s*=\s*(\d{2,5})\b",
-        r"\bsample of (\d{2,5})\b",
-        r"\b(\d{2,5})\s+participants\b",
-        r"\b(\d{2,5})\s+subjects\b",
-        r"\b(\d{2,5})\s+patients\b",
+        rf"\b[Nn]\s*=\s*{count}\b",
+        rf"\bsample of {count}\b",
+        rf"\b{count}\s+participants\b",
+        rf"\b{count}\s+subjects\b",
+        rf"\b{count}\s+patients\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             try:
-                return int(match.group(1))
+                return int(match.group(1).replace(",", ""))
             except ValueError:
                 continue
     return None
@@ -113,17 +114,42 @@ def _detect_effect_direction(text: str) -> str:
     if not text:
         return "unclear"
     lower = text.lower()
-    positive = any(word in lower for word in ["improve", "increase", "enhance", "benefit", "better"])
-    negative = any(word in lower for word in ["worse", "decrease", "impair", "decline"])
-    null = any(word in lower for word in ["no effect", "no significant", "not significant", "null"])
+
+    null_patterns = [
+        r"\bno\s+(?:statistically\s+)?significant\s+(?:effect|difference|change|improvement|increase|decrease)s?\b",
+        r"\b(?:not|wasn['’]t|were not)\s+(?:statistically\s+)?significant\b",
+        r"\bno\s+(?:effect|difference|benefit|improvement)s?\b",
+        r"\b(?:did|does|do)\s+not\s+(?:improve|increase|enhance|benefit|reduce|decrease)\b",
+        r"\bno\s+(?:evidence|association|relationship)\b",
+        r"\b(?:was|were|is|are)\s+not\s+associated\b",
+        r"\bnull\s+(?:effect|finding|result)s?\b",
+    ]
+    null = any(re.search(pattern, lower) for pattern in null_patterns)
+
+    # Remove negated phrases before looking for directional keywords. Without
+    # this, "no significant improvement" is incorrectly labelled positive.
+    directional_text = lower
+    for pattern in null_patterns:
+        directional_text = re.sub(pattern, " ", directional_text)
+
+    positive = any(
+        word in directional_text
+        for word in ["improve", "increase", "enhance", "benefit", "better"]
+    )
+    negative = any(
+        word in directional_text
+        for word in ["worse", "decrease", "impair", "decline"]
+    )
     if positive and negative:
         return "mixed"
+    if null and (positive or negative):
+        return "mixed"
+    if null:
+        return "null"
     if positive:
         return "positive"
     if negative:
         return "negative"
-    if null:
-        return "null"
     return "unclear"
 
 
@@ -176,7 +202,7 @@ def _extract_key_findings_from_abstract(abstract: str) -> str | None:
 
 def _fallback_extract(paper: Paper) -> StudyExtraction:
     abstract = paper.abstract or ""
-    abstract_lower = abstract.lower()
+    study_description_lower = f"{paper.title}. {abstract}".lower()
     
     # Try to extract a meaningful finding from the abstract
     summary = _extract_key_findings_from_abstract(abstract)
@@ -190,13 +216,13 @@ def _fallback_extract(paper: Paper) -> StudyExtraction:
             # Last resort: use title but prefix it clearly
             summary = f"Study examining: {paper.title}" if paper.title else "No abstract available."
     
-    if "meta-analysis" in abstract_lower or "meta analysis" in abstract_lower:
+    if "meta-analysis" in study_description_lower or "meta analysis" in study_description_lower:
         study_type = "meta_analysis"
-    elif "systematic review" in abstract_lower:
+    elif "systematic review" in study_description_lower:
         study_type = "systematic_review"
-    elif "randomized" in abstract_lower or "randomised" in abstract_lower or "controlled trial" in abstract_lower:
+    elif "randomized" in study_description_lower or "randomised" in study_description_lower or "controlled trial" in study_description_lower:
         study_type = "RCT"
-    elif "observational" in abstract_lower or "cohort" in abstract_lower or "case-control" in abstract_lower:
+    elif "observational" in study_description_lower or "cohort" in study_description_lower or "case-control" in study_description_lower:
         study_type = "observational"
     else:
         study_type = "unknown"
@@ -253,22 +279,24 @@ def _build_prompt(paper: Paper) -> str:
 
 
 async def extract_all(papers: List[Paper], llm: ChatLLM) -> List[StudyExtraction]:
-    """Extract study information from papers sequentially."""
-    results: List[StudyExtraction] = []
-
-    for paper in papers:
+    """Extract study information concurrently, preserving paper order."""
+    async def extract_one(paper: Paper) -> StudyExtraction:
         if not llm.available:
-            results.append(_fallback_extract(paper))
-            continue
+            return _fallback_extract(paper)
 
         try:
             raw = await llm.chat(EXTRACTOR_SYSTEM, _build_prompt(paper), max_tokens=700, temperature=0.1)
             data = safe_json_loads(raw)
             extraction = StudyExtraction.model_validate(data)
-            if not extraction.url:
-                extraction.url = paper.url
-            results.append(extraction)
+            extraction = extraction.model_copy(
+                update={
+                    # The paper id is pipeline identity, not an LLM-generated field.
+                    "paper_id": paper.paper_id,
+                    "url": extraction.url or paper.url,
+                }
+            )
+            return extraction
         except (LLMUnavailableError, LLMRequestError, ValueError):
-            results.append(_fallback_extract(paper))
+            return _fallback_extract(paper)
 
-    return results
+    return list(await asyncio.gather(*(extract_one(paper) for paper in papers)))

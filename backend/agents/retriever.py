@@ -4,8 +4,8 @@ import asyncio
 import re
 from typing import List, Tuple
 
-from semantic_scholar import SemanticScholarClient
-from schemas import Paper
+from ..semantic_scholar import SemanticScholarClient, SemanticScholarError
+from ..schemas import Paper
 
 
 _CLIENT = SemanticScholarClient()
@@ -31,7 +31,7 @@ def _simplify_query(question: str) -> List[str]:
         if keyword_query not in queries:
             queries.append(keyword_query)
     
-    return queries
+    return list(dict.fromkeys(query.strip() for query in queries if query.strip()))
 
 
 async def retrieve_papers(
@@ -50,24 +50,31 @@ async def retrieve_papers(
         "queries_tried": [],
         "total_attempts": 0,
         "successful_query": None,
+        "errors": [],
     }
     
     queries = _simplify_query(question)
     
     for query in queries:
-        for attempt in range(max_retries):
+        for attempt in range(max(1, max_retries)):
             metadata["total_attempts"] += 1
             metadata["queries_tried"].append(query)
-            
-            papers = await _CLIENT.search_papers(query, limit=limit)
+
+            try:
+                papers = await _CLIENT.search_papers(query, limit=limit)
+            except SemanticScholarError as exc:
+                metadata["errors"].append(str(exc))
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
             
             if papers:
                 metadata["successful_query"] = query
                 return papers, metadata
-            
-            # Wait before retry with exponential backoff
-            if attempt < max_retries - 1:
-                await asyncio.sleep(0.5 * (2 ** attempt))
+
+            # A successful empty response is not transient; reformulate the
+            # query instead of repeating the same search and sleeping.
+            break
     
     # No papers found with any query
     return [], metadata

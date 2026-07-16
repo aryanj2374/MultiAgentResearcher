@@ -47,6 +47,11 @@ class StudyExtraction(BaseModel):
     apa_citation: str
     url: str | None = None
 
+    @field_validator("limitations", mode="before")
+    @classmethod
+    def coerce_limitations_to_list(cls, value):
+        return [value] if isinstance(value, str) else value
+
 
 RiskOfBias = Literal["low", "medium", "high", "unknown"]
 
@@ -58,6 +63,11 @@ class Critique(BaseModel):
     risk_of_bias: RiskOfBias
     rationale: list[str]
     red_flags: list[str]
+
+    @field_validator("rationale", "red_flags", mode="before")
+    @classmethod
+    def coerce_details_to_list(cls, value):
+        return [value] if isinstance(value, str) else value
 
 
 class Synthesis(BaseModel):
@@ -104,7 +114,7 @@ class ResearchPlan(BaseModel):
     is_complex: bool
     original_question: str
     sub_questions: list[str]
-    strategy: str  # "direct" | "decompose"
+    strategy: Literal["direct", "decompose"]
     reasoning: str
 
 
@@ -127,3 +137,7 @@ class RunResponse(BaseModel):
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=500)
 
+    @field_validator("question", mode="before")
+    @classmethod
+    def normalize_question(cls, value):
+        return value.strip() if isinstance(value, str) else value

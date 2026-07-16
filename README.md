@@ -49,22 +49,23 @@ graph TD
 ### 1. Backend
 
 ```bash
-cd backend
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 ```
 
 **Configuration (`backend/.env`):**
 ```env
 HF_TOKEN=your_huggingface_token
 HF_MODEL=meta-llama/Llama-3.1-8B-Instruct
+HF_MAX_CONCURRENCY=5
 SEMANTIC_SCHOLAR_API_KEY=optional_key
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 ```
 
 Run the server:
 ```bash
-uvicorn main:app --reload
+uvicorn backend.main:app --reload
 ```
 
 ### 2. Frontend
@@ -73,6 +74,17 @@ uvicorn main:app --reload
 cd frontend
 npm install
 npm run dev
+```
+
+The frontend uses same-origin `/api` requests by default (proxied to port 8000 in development).
+For a separately hosted API, set `VITE_API_BASE_URL` in the frontend environment.
+
+### 3. Verification
+
+```bash
+python -m unittest discover -s backend/tests -v
+ruff check backend
+cd frontend && npm run build
 ```
 
 ## Usage

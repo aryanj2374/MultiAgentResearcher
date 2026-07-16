@@ -4,16 +4,12 @@ import asyncio
 import json
 from typing import List
 
-from llm import ChatLLM, LLMRequestError, LLMUnavailableError
-from schemas import Critique, Paper, StudyExtraction
-from utils import safe_json_loads
+from ..llm import ChatLLM, LLMRequestError, LLMUnavailableError
+from ..schemas import Critique, Paper, StudyExtraction
+from ..utils import safe_json_loads
 
 CRITIC_SYSTEM = """You assess study quality and risk of bias from limited metadata.
 Return ONLY valid JSON matching the schema. No commentary."""
-
-# Maximum concurrent LLM requests to stay within rate limits
-MAX_CONCURRENT_CRITIQUES = 5
-
 
 def _fallback_critique(extraction: StudyExtraction) -> Critique:
     study_type = extraction.study_type
@@ -60,23 +56,21 @@ async def critique_all(
     extractions: List[StudyExtraction],
     llm: ChatLLM,
 ) -> List[Critique]:
-    """Critique all extractions sequentially."""
+    """Critique all extractions concurrently, preserving extraction order."""
     paper_lookup = {p.paper_id: p for p in papers}
-    results: List[Critique] = []
 
-    for extraction in extractions:
+    async def critique_one(extraction: StudyExtraction) -> Critique:
         if not llm.available:
-            results.append(_fallback_critique(extraction))
-            continue
+            return _fallback_critique(extraction)
 
         try:
             paper = paper_lookup.get(extraction.paper_id)
             raw = await llm.chat(CRITIC_SYSTEM, _build_prompt(extraction, paper), max_tokens=400, temperature=0.2)
             data = safe_json_loads(raw)
             critique = Critique.model_validate(data)
-            results.append(critique)
+            critique = critique.model_copy(update={"paper_id": extraction.paper_id})
+            return critique
         except (LLMUnavailableError, LLMRequestError, ValueError, AttributeError):
-            results.append(_fallback_critique(extraction))
+            return _fallback_critique(extraction)
 
-    return results
-
+    return list(await asyncio.gather(*(critique_one(extraction) for extraction in extractions)))

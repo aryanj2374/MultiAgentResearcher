@@ -5,7 +5,7 @@ from typing import Any
 
 from huggingface_hub import InferenceClient
 
-from config import get_settings
+from .config import get_settings
 
 
 class LLMUnavailableError(RuntimeError):
@@ -22,6 +22,7 @@ class ChatLLM:
         self._token = settings.hf_token
         self._model = settings.hf_model
         self._timeout = settings.hf_timeout_s
+        self._semaphore = asyncio.Semaphore(settings.hf_max_concurrency)
         self._client: InferenceClient | None = None
 
         if self._token and self._model:
@@ -54,7 +55,8 @@ class ChatLLM:
             )
 
         try:
-            resp = await asyncio.to_thread(_call)
+            async with self._semaphore:
+                resp = await asyncio.to_thread(_call)
         except Exception as exc:  # pragma: no cover - network error
             raise LLMRequestError(f"LLM request failed: {exc}") from exc
 

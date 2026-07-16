@@ -32,26 +32,25 @@ function getStepNumber(agent: string): number {
   return AGENT_NAMES.indexOf(agent as typeof AGENT_NAMES[number]) + 1;
 }
 
-// Check if all sub-questions are completed
-function allSubQuestionsCompleted(subQuestions?: SubQuestionProgress[]): boolean {
+function allSubQuestionsSettled(subQuestions?: SubQuestionProgress[]): boolean {
   if (!subQuestions || subQuestions.length === 0) return false;
-  return subQuestions.every((sq) => sq.status === "completed");
+  return subQuestions.every((sq) => sq.status === "completed" || sq.status === "failed");
 }
 
 export default function AgentProgressWidget({ progress, subQuestions, isDeepResearch }: Props) {
-  const subQsCompleted = allSubQuestionsCompleted(subQuestions);
+  const subQsCompleted = allSubQuestionsSettled(subQuestions);
   
   return (
-    <div className="progress-widget">
+    <div className="progress-widget" role="status" aria-live="polite" aria-busy="true">
       <div className="progress-header">
-        <span className="progress-title">
-          {isDeepResearch ? "Deep Research" : "Processing"}
-        </span>
-        <span className="progress-dots">
-          <span />
-          <span />
-          <span />
-        </span>
+        <div className="progress-heading">
+          <span className="progress-mark" aria-hidden="true"><i /><i /><i /></span>
+          <div>
+            <span className="progress-title">{isDeepResearch ? "Deep research in progress" : "Building your evidence brief"}</span>
+            <span className="progress-subtitle">Working through the literature step by step</span>
+          </div>
+        </div>
+        <span className="progress-dots" aria-hidden="true"><span /><span /><span /></span>
       </div>
       
       <div className="progress-steps">
@@ -59,7 +58,7 @@ export default function AgentProgressWidget({ progress, subQuestions, isDeepRese
         {isDeepResearch && (
           <>
             {/* Planner Step */}
-            <div className={`progress-step has-children ${progress.planner}`}>
+            <div className={`progress-step agent-planner has-children ${progress.planner}`}>
               <div className="step-indicator">
                 <div className={`step-circle ${progress.planner}`}>
                   {progress.planner === "pending" && <span className="step-number">1</span>}
@@ -117,7 +116,7 @@ export default function AgentProgressWidget({ progress, subQuestions, isDeepRese
             )}
 
             {/* Synthesizer Step */}
-            <div className={`progress-step ${progress.synthesizer}`}>
+            <div className={`progress-step agent-synthesizer ${progress.synthesizer}`}>
               <div className="step-indicator">
                 <div className={`step-circle ${progress.synthesizer}`}>
                   {progress.synthesizer === "pending" && <span className="step-number">2</span>}
@@ -133,7 +132,7 @@ export default function AgentProgressWidget({ progress, subQuestions, isDeepRese
             </div>
 
             {/* Referee Step */}
-            <div className={`progress-step ${progress.referee}`}>
+            <div className={`progress-step agent-referee ${progress.referee}`}>
               <div className="step-indicator">
                 <div className={`step-circle ${progress.referee}`}>
                   {progress.referee === "pending" && <span className="step-number">3</span>}
@@ -155,7 +154,7 @@ export default function AgentProgressWidget({ progress, subQuestions, isDeepRese
           const isLast = idx === AGENT_NAMES.length - 1;
           
           return (
-            <div key={agent} className={`progress-step ${status}`}>
+            <div key={agent} className={`progress-step agent-${agent} ${status}`}>
               <div className="step-indicator">
                 <div className={`step-circle ${status}`}>
                   {status === "pending" && <span className="step-number">{getStepNumber(agent)}</span>}
@@ -165,7 +164,7 @@ export default function AgentProgressWidget({ progress, subQuestions, isDeepRese
               </div>
               <div className="step-content">
                 <span className={`step-label ${status}`}>{AGENT_LABELS[agent]}</span>
-                {status === "running" && <span className="step-status">In progress...</span>}
+                {status === "running" && <span className="step-status">Working now...</span>}
                 {status === "completed" && <span className="step-status done">Done</span>}
                 {status === "failed" && <span className="step-status error">Failed</span>}
               </div>
