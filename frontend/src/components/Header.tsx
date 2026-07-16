@@ -1,6 +1,5 @@
 type HeaderProps = {
   title: string;
-  subtitle: string;
   theme: "light" | "dark";
   onToggleTheme: () => void;
   onToggleSidebar: () => void;
@@ -8,41 +7,56 @@ type HeaderProps = {
 
 export default function Header({
   title,
-  subtitle,
   theme,
   onToggleTheme,
   onToggleSidebar,
 }: HeaderProps) {
   return (
-    <div className="chat-header">
+    <header className="chat-header">
       <div className="header-left">
         <button className="hamburger" onClick={onToggleSidebar} type="button" aria-label="Toggle sidebar">
-          ☰
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16" />
+          </svg>
         </button>
         <div className="header-title">
           <h2>{title.length > 40 ? title.slice(0, 40) + "..." : title}</h2>
-          <span>{subtitle}</span>
+          <span className="header-status">
+            <i aria-hidden="true" /> Evidence workspace
+          </span>
         </div>
       </div>
-      <button className="theme-toggle" onClick={onToggleTheme} type="button" aria-label="Toggle theme">
-        {theme === "dark" ? (
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="5" />
-            <line x1="12" y1="1" x2="12" y2="3" />
-            <line x1="12" y1="21" x2="12" y2="23" />
-            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
-            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
-            <line x1="1" y1="12" x2="3" y2="12" />
-            <line x1="21" y1="12" x2="23" y2="12" />
-            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
-            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
-          </svg>
-        ) : (
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-          </svg>
-        )}
-      </button>
-    </div>
+      <div className="header-actions">
+        <span className="agent-count" aria-label="Six specialized research agents">
+          <span className="agent-stack" aria-hidden="true">
+            <i className="planner" />
+            <i className="retriever" />
+            <i className="extractor" />
+            <i className="critic" />
+            <i className="synthesizer" />
+            <i className="referee" />
+          </span>
+          6 agents
+        </span>
+        <button
+          className="theme-toggle"
+          onClick={onToggleTheme}
+          type="button"
+          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+        >
+          {theme === "dark" ? (
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.65 6.35l1.42-1.42" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z" />
+            </svg>
+          )}
+        </button>
+      </div>
+    </header>
   );
 }

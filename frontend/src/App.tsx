@@ -52,7 +52,9 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [composerText, setComposerText] = useState("");
   const [theme, setTheme] = useState<Theme>(initialState.theme);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(
+    () => typeof window === "undefined" || window.innerWidth > 768
+  );
   const [agentProgress, setAgentProgress] = useState<AgentProgress | null>(null);
   const [subQuestionProgress, setSubQuestionProgress] = useState<SubQuestionProgress[] | null>(null);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
@@ -67,6 +69,23 @@ export default function App() {
     saveTheme(theme);
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    if (!sidebarOpen || !window.matchMedia("(max-width: 768px)").matches) return;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSidebarOpen(false);
+    };
+
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [sidebarOpen]);
 
   const activeConversation = useMemo(
     () => conversations.find((conv) => conv.id === activeId) ?? null,
@@ -84,10 +103,16 @@ export default function App() {
     const convo = createConversation();
     setConversations((prev) => [convo, ...prev]);
     setActiveId(convo.id);
+    if (window.matchMedia("(max-width: 768px)").matches) setSidebarOpen(false);
   }, []);
 
   const handleSelectConversation = useCallback((id: string) => {
     setActiveId(id);
+    if (window.matchMedia("(max-width: 768px)").matches) setSidebarOpen(false);
+  }, []);
+
+  const handleSuggestionSelect = useCallback((question: string) => {
+    setComposerText(question);
   }, []);
 
   const appendTypingMessage = useCallback((convoId: string, question: string) => {
@@ -330,11 +355,14 @@ export default function App() {
           theme={theme}
           onToggleTheme={handleToggleTheme}
           onRetry={handleRetry}
+          onSuggestionSelect={handleSuggestionSelect}
         />
 
         <div className="composer-wrapper">
           <Composer value={composerText} loading={loading} onChange={setComposerText} onSend={handleSend} />
-          <p className="composer-footer">Responses may be inaccurate. Verify critical details.</p>
+          <p className="composer-footer">
+            Research summaries can be incomplete. Review source papers before making important decisions.
+          </p>
         </div>
       </div>
 
