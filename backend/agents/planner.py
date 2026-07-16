@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
-from typing import List
+import re
 
-from llm import ChatLLM, LLMRequestError, LLMUnavailableError
-from schemas import ResearchPlan
-from utils import safe_json_loads
+from ..llm import ChatLLM, LLMRequestError, LLMUnavailableError
+from ..schemas import ResearchPlan
+from ..utils import safe_json_loads
 
 
 PLANNER_SYSTEM = """You are a research planning assistant. Your job is to analyze research questions and determine if they should be broken down into sub-questions.
@@ -48,33 +47,17 @@ Return JSON only."""
 
 def _heuristic_plan(question: str) -> ResearchPlan:
     """Fallback heuristic when LLM is unavailable."""
-    # Simple heuristic: check for compound indicators
-    compound_indicators = [
-        " and ",
-        " or ",
-        " versus ",
-        " vs ",
-        " compared to ",
-        " as well as ",
-        ", and ",
-    ]
-    
-    question_lower = question.lower()
-    is_complex = any(indicator in question_lower for indicator in compound_indicators)
-    
-    if is_complex:
-        # Simple split on "and" to generate sub-questions
-        parts = question.lower().replace("?", "").split(" and ")
-        sub_questions = [
-            f"What is the effect of {part.strip()}?" 
-            for part in parts[:3]  # Max 3
-            if len(part.strip()) > 10
-        ]
-        if len(sub_questions) < 2:
-            # Not enough meaningful parts, treat as simple
-            is_complex = False
-            sub_questions = []
-    else:
+    # Only split when "and" clearly introduces another complete question.
+    # Splitting any occurrence corrupts ordinary phrases such as "diet and
+    # exercise" and produces unusable Semantic Scholar queries.
+    parts = re.split(
+        r"\s+and\s+(?=(?:does|do|is|are|can|could|should|what|how)\b)",
+        question.rstrip("?"),
+        flags=re.IGNORECASE,
+    )[:4]
+    sub_questions = [f"{part.strip()}?" for part in parts if len(part.split()) >= 3]
+    is_complex = len(sub_questions) >= 2
+    if not is_complex:
         sub_questions = []
     
     return ResearchPlan(
@@ -105,16 +88,24 @@ async def plan_research(question: str, llm: ChatLLM) -> ResearchPlan:
         )
         data = safe_json_loads(raw)
         plan = ResearchPlan.model_validate(data)
+        plan.original_question = question
         
-        # Enforce max 4 sub-questions
-        if len(plan.sub_questions) > 4:
-            plan.sub_questions = plan.sub_questions[:4]
+        # Normalize LLM output so contradictory plan fields cannot leak into
+        # orchestration and UI state.
+        normalized_sub_questions = list(
+            dict.fromkeys(item.strip() for item in plan.sub_questions if item.strip())
+        )[:4]
+        plan.sub_questions = normalized_sub_questions
         
         # Ensure at least 2 sub-questions for decompose strategy
         if plan.strategy == "decompose" and len(plan.sub_questions) < 2:
             plan.strategy = "direct"
             plan.sub_questions = []
             plan.reasoning += " (Insufficient sub-questions, falling back to direct)"
+
+        plan.is_complex = plan.strategy == "decompose"
+        if plan.strategy == "direct":
+            plan.sub_questions = []
         
         return plan
         

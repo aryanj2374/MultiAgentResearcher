@@ -31,6 +31,10 @@ export default function ChatWindow({
   const [autoScroll, setAutoScroll] = useState(true);
 
   useEffect(() => {
+    setAutoScroll(true);
+  }, [conversation?.id]);
+
+  useEffect(() => {
     if (!scrollRef.current || !autoScroll) return;
     scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [conversation?.messages, loading, autoScroll]);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ChatWindow from "./components/ChatWindow";
 import Composer from "./components/Composer";
 import Sidebar from "./components/Sidebar";
@@ -8,11 +8,21 @@ import type { AgentName, AgentProgress, BackendResponse, Conversation, Message, 
 import { createInitialProgress } from "./types";
 
 function createId() {
-  return crypto.randomUUID();
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function now() {
   return new Date().toISOString();
+}
+
+function createConversation(): Conversation {
+  return {
+    id: createId(),
+    title: "New chat",
+    createdAt: now(),
+    messages: [],
+  };
 }
 
 function buildTitle(messages: Message[]): string {
@@ -28,35 +38,26 @@ function buildSummary(content: string, response?: BackendResponse): string {
 }
 
 export default function App() {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [initialState] = useState(() => {
+    const stored = loadConversations();
+    const initialConversations = stored.length > 0 ? stored : [createConversation()];
+    return {
+      conversations: initialConversations,
+      activeId: initialConversations[0].id,
+      theme: loadTheme() ?? ("dark" as Theme),
+    };
+  });
+  const [conversations, setConversations] = useState<Conversation[]>(initialState.conversations);
+  const [activeId, setActiveId] = useState<string | null>(initialState.activeId);
   const [loading, setLoading] = useState(false);
   const [composerText, setComposerText] = useState("");
-  const [theme, setTheme] = useState<Theme>("dark");
+  const [theme, setTheme] = useState<Theme>(initialState.theme);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [agentProgress, setAgentProgress] = useState<AgentProgress | null>(null);
   const [subQuestionProgress, setSubQuestionProgress] = useState<SubQuestionProgress[] | null>(null);
   const [isDeepResearch, setIsDeepResearch] = useState(false);
-
-  useEffect(() => {
-    const stored = loadConversations();
-    if (stored.length > 0) {
-      setConversations(stored);
-      setActiveId(stored[0].id);
-    } else {
-      // Auto-create a new conversation on first load
-      const newConv: Conversation = {
-        id: createId(),
-        title: "New chat",
-        createdAt: now(),
-        messages: [],
-      };
-      setConversations([newConv]);
-      setActiveId(newConv.id);
-    }
-    const storedTheme = loadTheme();
-    if (storedTheme) setTheme(storedTheme);
-  }, []);
+  const [requestConversationId, setRequestConversationId] = useState<string | null>(null);
+  const requestInFlightRef = useRef(false);
 
   useEffect(() => {
     saveConversations(conversations);
@@ -80,12 +81,7 @@ export default function App() {
   );
 
   const handleNewChat = useCallback(() => {
-    const convo: Conversation = {
-      id: createId(),
-      title: "New chat",
-      createdAt: now(),
-      messages: [],
-    };
+    const convo = createConversation();
     setConversations((prev) => [convo, ...prev]);
     setActiveId(convo.id);
   }, []);
@@ -112,16 +108,12 @@ export default function App() {
   }, [updateConversation]);
 
   const handleSend = useCallback(async () => {
-    if (!composerText.trim()) return;
+    if (requestInFlightRef.current || loading || !composerText.trim()) return;
+    requestInFlightRef.current = true;
 
     let convoId = activeId;
     if (!convoId) {
-      const convo: Conversation = {
-        id: createId(),
-        title: "New chat",
-        createdAt: now(),
-        messages: [],
-      };
+      const convo = createConversation();
       setConversations((prev) => [convo, ...prev]);
       convoId = convo.id;
       setActiveId(convo.id);
@@ -137,6 +129,7 @@ export default function App() {
 
     setComposerText("");
     setLoading(true);
+    setRequestConversationId(convoId);
 
     updateConversation(convoId, (conv) => {
       const messages = [...conv.messages, userMessage];
@@ -213,14 +206,19 @@ export default function App() {
       setAgentProgress(null);
       setSubQuestionProgress(null);
       setIsDeepResearch(false);
+      setRequestConversationId(null);
+      requestInFlightRef.current = false;
     }
-  }, [activeId, appendTypingMessage, composerText, updateConversation]);
+  }, [activeId, appendTypingMessage, composerText, loading, updateConversation]);
 
   const handleRetry = useCallback(
     async (messageId: string, question: string) => {
-      if (!activeId) return;
+      if (!activeId || requestInFlightRef.current || loading) return;
+      requestInFlightRef.current = true;
+      const convoId = activeId;
       setLoading(true);
-      updateConversation(activeId, (conv) => {
+      setRequestConversationId(convoId);
+      updateConversation(convoId, (conv) => {
         const messages = conv.messages.map((msg) =>
           msg.id === messageId
             ? {
@@ -268,7 +266,7 @@ export default function App() {
         }
 
         if (finalResponse) {
-          updateConversation(activeId, (conv) => {
+          updateConversation(convoId, (conv) => {
             const messages = conv.messages.map((msg) =>
               msg.id === messageId
                 ? {
@@ -282,7 +280,7 @@ export default function App() {
           });
         }
       } catch (error) {
-        updateConversation(activeId, (conv) => {
+        updateConversation(convoId, (conv) => {
           const messages = conv.messages.map((msg) =>
             msg.id === messageId
               ? {
@@ -299,9 +297,11 @@ export default function App() {
         setAgentProgress(null);
         setSubQuestionProgress(null);
         setIsDeepResearch(false);
+        setRequestConversationId(null);
+        requestInFlightRef.current = false;
       }
     },
-    [activeId, updateConversation]
+    [activeId, loading, updateConversation]
   );
 
   const handleToggleTheme = useCallback(() => {
@@ -323,9 +323,9 @@ export default function App() {
         <ChatWindow
           conversation={activeConversation}
           loading={loading}
-          agentProgress={agentProgress}
-          subQuestionProgress={subQuestionProgress}
-          isDeepResearch={isDeepResearch}
+          agentProgress={requestConversationId === activeId ? agentProgress : null}
+          subQuestionProgress={requestConversationId === activeId ? subQuestionProgress : null}
+          isDeepResearch={requestConversationId === activeId && isDeepResearch}
           onToggleSidebar={() => setSidebarOpen((prev) => !prev)}
           theme={theme}
           onToggleTheme={handleToggleTheme}

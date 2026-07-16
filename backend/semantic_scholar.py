@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import httpx
 
-from config import get_settings
-from schemas import Paper
+from .config import get_settings
+from .schemas import Paper
+
+
+class SemanticScholarError(RuntimeError):
+    """Raised when Semantic Scholar could not complete a search request."""
 
 
 class SemanticScholarClient:
@@ -15,11 +19,12 @@ class SemanticScholarClient:
         self._timeout = settings.semantic_scholar_timeout_s
         self._api_key = settings.semantic_scholar_api_key
         self._user_agent = settings.semantic_scholar_user_agent
-        self._cache: Dict[str, List[Paper]] = {}
+        self._cache: Dict[Tuple[str, int], List[Paper]] = {}
 
     async def search_papers(self, query: str, limit: int = 8) -> List[Paper]:
-        if query in self._cache:
-            return self._cache[query]
+        cache_key = (query, limit)
+        if cache_key in self._cache:
+            return list(self._cache[cache_key])
 
         url = f"{self._base_url}/paper/search"
         params = {
@@ -36,23 +41,40 @@ class SemanticScholarClient:
                 resp = await client.get(url, params=params, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-        except httpx.HTTPError:
-            return []
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SemanticScholarError(f"Semantic Scholar search failed: {exc}") from exc
+
+        if not isinstance(data, dict) or not isinstance(data.get("data", []), list):
+            raise SemanticScholarError("Semantic Scholar returned an unexpected response format")
 
         papers = []
+        seen_paper_ids: set[str] = set()
         for item in data.get("data", []):
-            authors = [a.get("name", "") for a in item.get("authors", []) if a.get("name")]
-            paper = Paper(
-                paper_id=item.get("paperId", ""),
-                title=item.get("title", ""),
-                authors=authors,
-                year=item.get("year"),
-                venue=item.get("venue"),
-                url=item.get("url"),
-                abstract=item.get("abstract"),
-            )
-            if paper.paper_id and paper.title:
+            if not isinstance(item, dict):
+                continue
+            raw_authors = item.get("authors", [])
+            if not isinstance(raw_authors, list):
+                raw_authors = []
+            authors = [
+                author.get("name", "")
+                for author in raw_authors
+                if isinstance(author, dict) and author.get("name")
+            ]
+            try:
+                paper = Paper(
+                    paper_id=item.get("paperId", ""),
+                    title=item.get("title", ""),
+                    authors=authors,
+                    year=item.get("year"),
+                    venue=item.get("venue"),
+                    url=item.get("url"),
+                    abstract=item.get("abstract"),
+                )
+            except ValueError:
+                continue
+            if paper.paper_id and paper.title and paper.paper_id not in seen_paper_ids:
                 papers.append(paper)
+                seen_paper_ids.add(paper.paper_id)
 
-        self._cache[query] = papers
-        return papers
+        self._cache[cache_key] = papers
+        return list(papers)

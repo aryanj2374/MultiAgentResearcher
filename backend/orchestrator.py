@@ -4,22 +4,52 @@ import asyncio
 from typing import Any, AsyncGenerator
 from uuid import uuid4
 
-from agents.critic import critique_all
-from agents.extractor import extract_all
-from agents.planner import plan_research
-from agents.referee import verify_synthesis
-from agents.retriever import retrieve_papers
-from agents.synthesizer import synthesize
-from llm import ChatLLM
-from schemas import (
+from .agents.critic import critique_all
+from .agents.extractor import extract_all
+from .agents.planner import plan_research
+from .agents.referee import verify_synthesis
+from .agents.retriever import retrieve_papers
+from .agents.synthesizer import synthesize
+from .llm import ChatLLM
+from .schemas import (
     Critique,
     Paper,
-    ResearchPlan,
     RunResponse,
     StudyExtraction,
     SubQuestionResult,
 )
-from storage import save_run
+from .storage import save_run
+
+
+def _merge_sub_results(
+    sub_results: list[SubQuestionResult],
+) -> tuple[list[Paper], list[StudyExtraction], list[Critique]]:
+    """Merge branch results without counting the same paper more than once."""
+    papers_by_id: dict[str, Paper] = {}
+    extractions_by_id: dict[str, StudyExtraction] = {}
+    critiques_by_id: dict[str, Critique] = {}
+
+    for result in sub_results:
+        for paper in result.papers:
+            papers_by_id.setdefault(paper.paper_id, paper)
+        for extraction in result.extractions:
+            extractions_by_id.setdefault(extraction.paper_id, extraction)
+        for critique in result.critiques:
+            critiques_by_id.setdefault(critique.paper_id, critique)
+
+    paper_ids = set(papers_by_id)
+    papers = list(papers_by_id.values())
+    extractions = [
+        extraction
+        for paper_id, extraction in extractions_by_id.items()
+        if paper_id in paper_ids
+    ]
+    critiques = [
+        critique
+        for paper_id, critique in critiques_by_id.items()
+        if paper_id in paper_ids
+    ]
+    return papers, extractions, critiques
 
 
 async def _process_single_question(
@@ -81,28 +111,23 @@ async def run_question(question: str) -> RunResponse:
             )
         
         # Process all sub-questions in parallel
-        sub_results = await asyncio.gather(*[
-            process_sub_question(sq, i) 
-            for i, sq in enumerate(plan.sub_questions)
-        ])
-        
-        # Merge results from all sub-questions
-        all_papers: list[Paper] = []
-        all_extractions: list[StudyExtraction] = []
-        all_critiques: list[Critique] = []
-        seen_paper_ids: set[str] = set()
-        
-        for result in sub_results:
-            for paper in result.papers:
-                if paper.paper_id not in seen_paper_ids:
-                    all_papers.append(paper)
-                    seen_paper_ids.add(paper.paper_id)
-            all_extractions.extend(result.extractions)
-            all_critiques.extend(result.critiques)
-        
-        papers = all_papers
-        extractions = all_extractions
-        critiques = all_critiques
+        branch_results = await asyncio.gather(
+            *[
+                process_sub_question(sq, i)
+                for i, sq in enumerate(plan.sub_questions)
+            ],
+            return_exceptions=True,
+        )
+        sub_results = []
+        for idx, result in enumerate(branch_results):
+            if isinstance(result, Exception):
+                logs["notes"].append(
+                    f"Sub-question {idx + 1} failed: {type(result).__name__}: {result}"
+                )
+            else:
+                sub_results.append(result)
+
+        papers, extractions, critiques = _merge_sub_results(sub_results)
     else:
         # Direct research mode
         papers, extractions, critiques, logs = await _process_single_question(
@@ -187,27 +212,27 @@ async def run_question_with_progress(question: str) -> AsyncGenerator[dict[str, 
             "sub_questions": plan.sub_questions,
         }
         
-        async def process_sub_with_progress(sub_q: str, idx: int):
-            """Process a sub-question and return result (progress handled separately)."""
+        async def process_sub_with_progress(
+            sub_q: str, idx: int
+        ) -> tuple[int, SubQuestionResult | None, dict[str, Any], str | None]:
+            """Process one branch and return its outcome to the event loop."""
             sub_logs: dict[str, Any] = {}
-            papers, retrieval_meta = await retrieve_papers(sub_q)
-            sub_logs["retrieve"] = {
-                "question": sub_q,
-                "count": len(papers),
-            }
-            
-            extractions = await extract_all(papers, llm)
-            critiques = await critique_all(papers, extractions, llm)
-            
-            logs[f"sub_question_{idx}"] = sub_logs
-            return SubQuestionResult(
-                sub_question=sub_q,
-                papers=papers,
-                extractions=extractions,
-                critiques=critiques,
-            )
-        
-        # Process sub-questions and yield progress for each
+            try:
+                papers, extractions, critiques, _ = await _process_single_question(
+                    sub_q, llm, sub_logs
+                )
+                result = SubQuestionResult(
+                    sub_question=sub_q,
+                    papers=papers,
+                    extractions=extractions,
+                    critiques=critiques,
+                )
+                return idx, result, sub_logs, None
+            except Exception as exc:
+                return idx, None, sub_logs, str(exc)
+
+        # Start every branch before awaiting results so deep research is truly
+        # parallel while still emitting completion events as each branch ends.
         sub_results = []
         for idx, sub_q in enumerate(plan.sub_questions):
             yield {
@@ -216,47 +241,52 @@ async def run_question_with_progress(question: str) -> AsyncGenerator[dict[str, 
                 "sub_question": sub_q,
                 "status": "running",
             }
-            try:
-                result = await process_sub_with_progress(sub_q, idx)
-                sub_results.append(result)
-                yield {
-                    "type": "sub_question_progress",
-                    "index": idx,
-                    "sub_question": sub_q,
-                    "status": "completed",
-                    "papers_found": len(result.papers),
-                }
-            except Exception as e:
-                yield {
-                    "type": "sub_question_progress",
-                    "index": idx,
-                    "sub_question": sub_q,
-                    "status": "failed",
-                    "message": str(e),
-                }
-        
-        # Merge results
-        all_papers: list[Paper] = []
-        all_extractions: list[StudyExtraction] = []
-        all_critiques: list[Critique] = []
-        seen_paper_ids: set[str] = set()
-        
-        for result in sub_results:
-            for paper in result.papers:
-                if paper.paper_id not in seen_paper_ids:
-                    all_papers.append(paper)
-                    seen_paper_ids.add(paper.paper_id)
-            all_extractions.extend(result.extractions)
-            all_critiques.extend(result.critiques)
-        
-        papers = all_papers
-        extractions = all_extractions
-        critiques = all_critiques
-        
-        # Mark retriever/extractor/critic as completed (they ran per sub-question)
-        yield {"type": "progress", "agent": "retriever", "status": "completed"}
-        yield {"type": "progress", "agent": "extractor", "status": "completed"}
-        yield {"type": "progress", "agent": "critic", "status": "completed"}
+
+        tasks = [
+            asyncio.create_task(process_sub_with_progress(sub_q, idx))
+            for idx, sub_q in enumerate(plan.sub_questions)
+        ]
+        try:
+            for completed in asyncio.as_completed(tasks):
+                idx, result, sub_logs, error = await completed
+                sub_q = plan.sub_questions[idx]
+                logs[f"sub_question_{idx}"] = sub_logs
+                if result is not None:
+                    sub_results.append(result)
+                    yield {
+                        "type": "sub_question_progress",
+                        "index": idx,
+                        "sub_question": sub_q,
+                        "status": "completed",
+                        "papers_found": len(result.papers),
+                    }
+                else:
+                    logs["notes"].append(f"Sub-question {idx + 1} failed: {error}")
+                    yield {
+                        "type": "sub_question_progress",
+                        "index": idx,
+                        "sub_question": sub_q,
+                        "status": "failed",
+                        "message": error,
+                    }
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        sub_question_order = {
+            sub_question: index for index, sub_question in enumerate(plan.sub_questions)
+        }
+        sub_results.sort(key=lambda result: sub_question_order[result.sub_question])
+        papers, extractions, critiques = _merge_sub_results(sub_results)
+
+        # These agents ran inside each branch. A partial branch failure is
+        # recorded above but does not discard successful evidence.
+        branch_status = "completed" if sub_results else "failed"
+        yield {"type": "progress", "agent": "retriever", "status": branch_status}
+        yield {"type": "progress", "agent": "extractor", "status": branch_status}
+        yield {"type": "progress", "agent": "critic", "status": branch_status}
         
     else:
         # Direct research mode - standard pipeline

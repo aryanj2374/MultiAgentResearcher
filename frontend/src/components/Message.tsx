@@ -131,8 +131,8 @@ export default function Message({ message, onRetry }: MessageProps) {
                 <section>
                   <h4>Sources ({response.papers.length})</h4>
                   <ul>
-                    {response.papers.map((paper) => (
-                      <li key={paper.paper_id}>
+                    {response.papers.map((paper, index) => (
+                      <li key={`${paper.paper_id}-${index}`}>
                         <strong>{paper.title}</strong>
                         <span className="paper-meta">
                           — {paper.authors.slice(0, 2).join(", ")}{paper.authors.length > 2 ? " et al." : ""} {paper.year ?? ""}
@@ -158,11 +158,11 @@ export default function Message({ message, onRetry }: MessageProps) {
                       <div>Bias Risk</div>
                       <div>Key Finding</div>
                     </div>
-                    {response.extractions.map((extraction) => {
+                    {response.extractions.map((extraction, index) => {
                       const critique = response.critiques.find((item) => item.paper_id === extraction.paper_id);
                       const paper = response.papers.find((p) => p.paper_id === extraction.paper_id);
                       return (
-                        <div className="table-row" key={extraction.paper_id}>
+                        <div className="table-row" key={`${extraction.paper_id}-${index}`}>
                           <div>{paper?.title?.slice(0, 40) ?? extraction.paper_id.slice(0, 8)}...</div>
                           <div>{extraction.study_type.replace("_", " ")}</div>
                           <div>{extraction.effect_direction ?? "—"}</div>
