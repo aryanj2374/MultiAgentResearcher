@@ -1621,6 +1621,38 @@ textarea:focus-visible {
 .retry-btn svg { width: 13px; height: 13px; }
 
 /* Composer */
+.storage-notice {
+  display: flex;
+  width: min(100%, var(--message-max));
+  margin: 0 auto;
+  padding: 9px 12px;
+  position: relative;
+  z-index: 16;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--semantic-warning, #d8a13a) 8%, var(--bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--semantic-warning, #d8a13a) 30%, var(--border-soft));
+  border-radius: 5px;
+}
+
+.storage-notice button {
+  padding: 3px 8px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 650;
+  background: none;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.storage-notice button:hover { color: var(--text-primary); border-color: var(--accent); }
+.storage-notice button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .composer-wrapper {
   position: relative;
   z-index: 15;

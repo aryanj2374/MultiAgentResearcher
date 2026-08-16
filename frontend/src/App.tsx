@@ -61,8 +61,25 @@ export default function App() {
   const [requestConversationId, setRequestConversationId] = useState<string | null>(null);
   const requestInFlightRef = useRef(false);
 
+  const [storageNotice, setStorageNotice] = useState<string | null>(null);
+
   useEffect(() => {
-    saveConversations(conversations);
+    const result = saveConversations(conversations);
+    if (result.ok) {
+      setStorageNotice(null);
+      return;
+    }
+    if (result.reason === "unavailable") {
+      setStorageNotice("Browser storage is unavailable, so this history will not be saved.");
+    } else if (result.dropped >= conversations.length) {
+      setStorageNotice("This conversation is too large for browser storage and will not be saved.");
+    } else {
+      setStorageNotice(
+        result.dropped === 1
+          ? "Browser storage is full, so the oldest conversation was removed to save this one."
+          : `Browser storage is full, so the ${result.dropped} oldest conversations were removed to save this one.`
+      );
+    }
   }, [conversations]);
 
   useEffect(() => {
@@ -357,6 +374,15 @@ export default function App() {
           onRetry={handleRetry}
           onSuggestionSelect={handleSuggestionSelect}
         />
+
+        {storageNotice && (
+          <div className="storage-notice" role="status">
+            <span>{storageNotice}</span>
+            <button type="button" onClick={() => setStorageNotice(null)} aria-label="Dismiss storage notice">
+              Dismiss
+            </button>
+          </div>
+        )}
 
         <div className="composer-wrapper">
           <Composer value={composerText} loading={loading} onChange={setComposerText} onSend={handleSend} />

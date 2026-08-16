@@ -71,6 +71,13 @@ export type Verification = {
   revised_synthesis?: Synthesis | null;
 };
 
+export type SubQuestionResult = {
+  sub_question: string;
+  papers: Paper[];
+  extractions: StudyExtraction[];
+  critiques: Critique[];
+};
+
 export type BackendResponse = {
   run_id: string;
   question: string;
@@ -80,6 +87,10 @@ export type BackendResponse = {
   synthesis: Synthesis;
   verification: Verification;
   logs?: Record<string, unknown> | null;
+  plan?: ResearchPlan | null;
+  sub_results?: SubQuestionResult[] | null;
+  /** Set when the persisted copy dropped `logs` and `sub_results` to fit quota. */
+  logs_trimmed?: boolean;
 };
 
 export type Theme = "dark" | "light";

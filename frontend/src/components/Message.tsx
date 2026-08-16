@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { BackendResponse, Message } from "../types";
 import Collapsible from "./Collapsible";
@@ -49,6 +49,17 @@ export default function MessageView({ message, onRetry }: MessageProps) {
   const [copied, setCopied] = useState(false);
   const response = message.meta?.response;
   const summary = useMemo(() => buildSummary(response, message.content), [response, message.content]);
+  const rawPanelRef = useRef<HTMLDivElement | null>(null);
+  const rawPanelId = `raw-response-${message.id}`;
+
+  // Toggling the panel changes nothing the chat's auto-scroll effect watches,
+  // so nothing brings it into view on its own. It now renders directly under
+  // the toggle, and "nearest" only nudges the view when the card sits low
+  // enough that the panel would still open past the bottom edge.
+  useEffect(() => {
+    if (!showRaw) return;
+    rawPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [showRaw]);
 
   const handleCopy = async () => {
     const textParts: string[] = [];
@@ -137,15 +148,31 @@ export default function MessageView({ message, onRetry }: MessageProps) {
                 )}
                 <span>{copied ? "Copied" : "Copy"}</span>
               </button>
-              <button className={`result-action ${showRaw ? "active" : ""}`} onClick={() => setShowRaw((current) => !current)} type="button" aria-expanded={showRaw} aria-label="Toggle raw response" title="Toggle raw response">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M14 5l-4 14" /></svg>
-                <span>Raw</span>
-              </button>
+              {response && (
+                <button className={`result-action ${showRaw ? "active" : ""}`} onClick={() => setShowRaw((current) => !current)} type="button" aria-expanded={showRaw} aria-controls={rawPanelId} aria-label="Toggle raw response" title="Toggle raw response">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m8 9-3 3 3 3M16 9l3 3-3 3M14 5l-4 14" /></svg>
+                  <span>Raw</span>
+                </button>
+              )}
             </div>
           </div>
 
           {response ? (
             <div className="assistant-content">
+              {/* Sits directly under the toggle rather than at the foot of the
+                  card. The card is several thousand pixels tall with a full
+                  evidence table, so a panel appended at the end opens entirely
+                  off-screen and the button looks like it does nothing. */}
+              {showRaw && (
+                <div className="raw-response" id={rawPanelId} ref={rawPanelRef}>
+                  <div>
+                    <span>Raw response</span>
+                    <small>{response.logs_trimmed ? "Developer view · logs dropped when saved" : "Developer view"}</small>
+                  </div>
+                  <pre className="json-block">{JSON.stringify(response, null, 2)}</pre>
+                </div>
+              )}
+
               <div className="consensus-card">
                 <div className="consensus-label">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19V3" /></svg>
@@ -276,12 +303,6 @@ export default function MessageView({ message, onRetry }: MessageProps) {
                 <p className="pipeline-note">Six specialized agents planned the search, evaluated the retrieved evidence, synthesized the findings, and checked citation consistency.</p>
               </Collapsible>
 
-              {showRaw && (
-                <div className="raw-response">
-                  <div><span>Raw response</span><small>Developer view</small></div>
-                  <pre className="json-block">{JSON.stringify(response, null, 2)}</pre>
-                </div>
-              )}
             </div>
           ) : (
             <p>{message.content}</p>
