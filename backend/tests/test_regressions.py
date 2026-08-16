@@ -10,11 +10,22 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.agents.critic import critique_all
-from backend.agents.extractor import _detect_effect_direction, extract_all
+from backend.agents.extractor import (
+    _detect_effect_direction,
+    _extract_key_findings_from_abstract,
+    extract_all,
+)
 from backend.agents.planner import _heuristic_plan
 from backend.agents.referee import verify_synthesis
-from backend.agents.retriever import retrieve_papers
-from backend.agents.synthesizer import _fallback_synthesis
+from backend.agents.retriever import filter_relevant, retrieve_papers
+from backend.agents.synthesizer import (
+    _describe_direction,
+    _fallback_synthesis,
+    _no_evidence_synthesis,
+    _normalize_synthesis_payload,
+    _reconcile_citations,
+    synthesize,
+)
 from backend.main import generate_sse_events
 from backend.orchestrator import _merge_sub_results, run_question_with_progress
 from backend.schemas import (
@@ -23,6 +34,7 @@ from backend.schemas import (
     ResearchPlan,
     StudyExtraction,
     SubQuestionResult,
+    Synthesis,
     Verification,
     AskRequest,
 )
@@ -182,6 +194,102 @@ class RetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["total_attempts"], 3)
 
 
+class ExtractionQualityTests(unittest.TestCase):
+    def test_findings_are_preferred_over_background_framing(self) -> None:
+        abstract = (
+            "Background: Creatine supplementation is well-established for enhancing "
+            "physical performance. However, its effects on cognitive function have "
+            "not been thoroughly investigated. Methods: Fourteen men ingested 20 g/day "
+            "of creatine or placebo for 7 days. Results: Creatine resulted in "
+            "significantly lower muscle soreness scores (d = -0.59; p = 0.046) and "
+            "improved cognitive performance."
+        )
+        summary = _extract_key_findings_from_abstract(abstract)
+
+        self.assertIsNotNone(summary)
+        self.assertIn("significantly lower muscle soreness", summary)
+        self.assertNotIn("have not been thoroughly investigated", summary)
+
+    def test_objective_sentence_is_not_reported_as_a_finding(self) -> None:
+        abstract = (
+            "Objective: This study aimed to evaluate the effects of cold-water "
+            "immersion on post-training recovery in athletes. Results: Immersion "
+            "produced a greater reduction in creatine kinase than control "
+            "24 h after the intervention (-21.32%; p < 0.001)."
+        )
+        summary = _extract_key_findings_from_abstract(abstract)
+
+        self.assertIn("greater reduction in creatine kinase", summary)
+        self.assertNotIn("aimed to evaluate", summary)
+
+    def test_study_protocols_do_not_yield_future_tense_findings(self) -> None:
+        # Registered protocols describe planned work; nothing there is a result.
+        abstract = (
+            "Background Resistance training improves strength in older adults. "
+            "Methods Thirty-six older adults will be randomly assigned to one of "
+            "three groups. Results We hypothesize that training plus creatine will "
+            "result in greater improvements in body composition."
+        )
+        summary = _extract_key_findings_from_abstract(abstract)
+
+        self.assertIsNotNone(summary)
+        self.assertNotIn("will be randomly assigned", summary)
+        self.assertNotIn("will result in greater improvements", summary)
+
+    def test_unstructured_abstract_still_returns_a_result_sentence(self) -> None:
+        abstract = (
+            "Creatine is an organic compound found in muscle tissue and is widely "
+            "used by athletes across many sporting disciplines worldwide today. "
+            "We found that supplementation increased lean mass by 1.2 kg (p = 0.01) "
+            "relative to placebo across the full trial period."
+        )
+        summary = _extract_key_findings_from_abstract(abstract)
+
+        self.assertIn("increased lean mass", summary)
+
+
+class RelevanceFilterTests(unittest.TestCase):
+    def _paper(self, paper_id: str, title: str, abstract: str = "") -> Paper:
+        return Paper(
+            paper_id=paper_id,
+            title=title,
+            authors=["Alex Smith"],
+            year=2024,
+            abstract=abstract or title,
+        )
+
+    def test_papers_missing_the_subject_are_dropped(self) -> None:
+        question = "What are the effects of creatine on cognition and physicals?"
+        on_topic = self._paper(
+            "keep", "Effects of creatine supplementation on cognitive performance"
+        )
+        off_topic = self._paper(
+            "drop", "Relationships between cognition, function, and quality of life in HIV+ men"
+        )
+
+        kept, dropped = filter_relevant([on_topic, off_topic], question)
+
+        self.assertEqual([p.paper_id for p in kept], ["keep"])
+        self.assertEqual([p.paper_id for p in dropped], ["drop"])
+
+    def test_subject_papers_survive_without_every_outcome_term(self) -> None:
+        # A creatine safety paper is relevant even if it never says "cognition".
+        question = "What are the effects of creatine on cognition and physicals?"
+        safety = self._paper("safety", "Adverse effects of creatine supplementation")
+
+        kept, _ = filter_relevant([safety], question)
+
+        self.assertEqual([p.paper_id for p in kept], ["safety"])
+
+    def test_filter_never_returns_an_empty_set(self) -> None:
+        question = "What are the effects of creatine on cognition?"
+        unrelated = [self._paper("a", "Allergic rhinitis in schoolchildren")]
+
+        kept, _ = filter_relevant(unrelated, question)
+
+        self.assertEqual(len(kept), 1)
+
+
 class SynthesisTests(unittest.TestCase):
     def test_fallback_synthesis_passes_its_referee(self) -> None:
         papers = [make_paper("p1"), make_paper("p2")]
@@ -194,6 +302,117 @@ class SynthesisTests(unittest.TestCase):
         self.assertTrue(verification.passed, verification.issues)
         self.assertIn("Smith2024a", " ".join(synthesis.final_answer))
         self.assertIn("Smith2024b", " ".join(synthesis.final_answer))
+
+    def test_object_shaped_bullets_are_not_discarded(self) -> None:
+        # The model often returns {"text": ..., "citation": ...} objects. Those
+        # used to fail schema validation and silently drop a good synthesis.
+        papers = [make_paper("p1")]
+        payload = {
+            "final_answer": [
+                {"text": "Creatine improved strength.", "citation": "Smith2024"},
+                {"text": "No effect on memory [Smith2024]."},
+            ],
+            "evidence_consensus": ["Studies broadly agree.", "Effect sizes are small."],
+            "top_limitations_overall": "Abstract-only synthesis.",
+            "confidence_score": "72%",
+            "confidence_rationale": ["Consistent direction."],
+            "citations_used": ["Smith2024"],
+        }
+        normalized = _normalize_synthesis_payload(
+            payload, papers, build_citation_map(papers)
+        )
+        synthesis = Synthesis.model_validate(normalized)
+
+        self.assertEqual(
+            synthesis.final_answer,
+            ["Creatine improved strength. [Smith2024]", "No effect on memory [Smith2024]."],
+        )
+        self.assertEqual(synthesis.confidence_score, 72)
+        # Display labels are resolved back to pipeline paper ids.
+        self.assertEqual(synthesis.citations_used, ["p1"])
+        self.assertEqual(
+            synthesis.evidence_consensus, "Studies broadly agree. Effect sizes are small."
+        )
+
+    def test_missing_consensus_citation_is_backfilled(self) -> None:
+        papers = [make_paper("p1")]
+        synthesis = Synthesis(
+            final_answer=["Creatine improved strength [Smith2024]."],
+            evidence_consensus="Studies broadly agree.",
+            top_limitations_overall=["Abstract-only."],
+            confidence_score=60,
+            confidence_rationale=["Consistent."],
+            citations_used=[],
+        )
+        reconciled = _reconcile_citations(synthesis, papers, build_citation_map(papers))
+
+        self.assertIn("[Smith2024]", reconciled.evidence_consensus)
+        self.assertEqual(reconciled.citations_used, ["p1"])
+        self.assertTrue(verify_synthesis(reconciled, papers, []).passed)
+
+    def test_fallback_bullets_quote_findings_not_counts(self) -> None:
+        papers = [make_paper("p1"), make_paper("p2")]
+        extractions = [make_extraction("p1"), make_extraction("p2", "null")]
+        critiques = [make_critique("p1"), make_critique("p2")]
+
+        synthesis = _fallback_synthesis("Does it work?", papers, extractions, critiques)
+        themed = [b for b in synthesis.final_answer if b.startswith("**")]
+
+        self.assertTrue(themed, synthesis.final_answer)
+        self.assertIn("The intervention improved the measured outcome.", " ".join(themed))
+
+    def test_minority_positive_is_not_reported_as_consensus(self) -> None:
+        # 2 positive out of 6 must never read as "most studies report benefits".
+        self.assertIn("2 of 6", _describe_direction(2, 0, 6))
+        self.assertIn("most studies report benefits", _describe_direction(4, 1, 6))
+
+    def test_reviews_are_excluded_from_pooled_sample_size(self) -> None:
+        papers = [make_paper("p1"), make_paper("p2")]
+        primary = make_extraction("p1").model_copy(update={"sample_size": 600})
+        review = make_extraction("p2").model_copy(
+            update={"sample_size": 50000, "study_type": "meta_analysis"}
+        )
+        synthesis = _fallback_synthesis(
+            "Does it work?", papers, [primary, review], [make_critique("p1")]
+        )
+        coverage = [b for b in synthesis.final_answer if "Sample coverage" in b]
+
+        self.assertTrue(coverage)
+        self.assertIn("600 participants", coverage[0])
+        self.assertNotIn("50,600", coverage[0])
+
+    def test_fabricated_citations_never_reach_the_user(self) -> None:
+        # A small model will cite papers that were never retrieved. Presenting
+        # that as evidence is worse than presenting the heuristic fallback.
+        papers = [make_paper("p1")]
+        extractions = [make_extraction("p1")]
+        critiques = [make_critique("p1")]
+        invented = json.dumps(
+            {
+                "final_answer": ["Creatine boosts strength by 8% [Kreider2003]."],
+                "evidence_consensus": "Studies agree [Kreider2003].",
+                "top_limitations_overall": ["Abstract-only."],
+                "confidence_score": 90,
+                "confidence_rationale": ["Strong evidence."],
+                "citations_used": ["p1"],
+            }
+        )
+
+        synthesis = asyncio.run(
+            synthesize("Does creatine work?", papers, extractions, critiques, FakeLLM([invented]))
+        )
+
+        joined = " ".join(synthesis.final_answer)
+        self.assertNotIn("Kreider2003", joined)
+        self.assertTrue(verify_synthesis(synthesis, papers, critiques).passed)
+
+    def test_rate_limited_search_is_not_reported_as_no_research(self) -> None:
+        synthesis = _no_evidence_synthesis("Does creatine work?", rate_limited=True)
+
+        joined = " ".join(synthesis.final_answer).lower()
+        self.assertIn("rate limited", joined)
+        self.assertNotIn("no academic papers were found", joined)
+        self.assertEqual(synthesis.confidence_score, 0)
 
     def test_deep_results_do_not_double_count_papers(self) -> None:
         shared = make_paper("shared")

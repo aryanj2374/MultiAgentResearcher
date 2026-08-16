@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, List, Tuple
 
 import httpx
@@ -12,6 +13,14 @@ class SemanticScholarError(RuntimeError):
     """Raised when Semantic Scholar could not complete a search request."""
 
 
+class SemanticScholarRateLimited(SemanticScholarError):
+    """Raised when Semantic Scholar rejects a request with HTTP 429."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class SemanticScholarClient:
     def __init__(self) -> None:
         settings = get_settings()
@@ -20,6 +29,24 @@ class SemanticScholarClient:
         self._api_key = settings.semantic_scholar_api_key
         self._user_agent = settings.semantic_scholar_user_agent
         self._cache: Dict[Tuple[str, int], List[Paper]] = {}
+        # Deep research fans out sub-questions concurrently. Semantic Scholar
+        # rejects bursts with 429, so requests are serialised and spaced out
+        # rather than issued in parallel.
+        self._request_lock = asyncio.Lock()
+        self._min_interval = settings.semantic_scholar_min_interval_s
+        self._last_request_at = 0.0
+
+    async def _throttle(self) -> None:
+        """Space consecutive requests by at least the configured interval."""
+        wait_for = 0.0
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._last_request_at:
+            elapsed = now - self._last_request_at
+            wait_for = max(0.0, self._min_interval - elapsed)
+        if wait_for:
+            await asyncio.sleep(wait_for)
+        self._last_request_at = asyncio.get_running_loop().time()
 
     async def search_papers(self, query: str, limit: int = 8) -> List[Paper]:
         cache_key = (query, limit)
@@ -37,10 +64,23 @@ class SemanticScholarClient:
             headers["x-api-key"] = self._api_key
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.get(url, params=params, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
+            async with self._request_lock:
+                await self._throttle()
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    resp = await client.get(url, params=params, headers=headers)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else None
+                except ValueError:
+                    delay = None
+                raise SemanticScholarRateLimited(
+                    "Semantic Scholar rate limit reached (HTTP 429)", retry_after=delay
+                )
+            resp.raise_for_status()
+            data = resp.json()
+        except SemanticScholarError:
+            raise
         except (httpx.HTTPError, ValueError) as exc:
             raise SemanticScholarError(f"Semantic Scholar search failed: {exc}") from exc
 
