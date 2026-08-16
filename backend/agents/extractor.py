@@ -153,51 +153,214 @@ def _detect_effect_direction(text: str) -> str:
     return "unclear"
 
 
+_SECTION_WORDS = (
+    r"(?:background|introduction|context|rationale|objectives?|purpose"
+    r"|aims?|goals?|methods?|methodology|materials and methods|design|setting"
+    r"|participants|intervention|results?|findings|outcomes?|conclusions?"
+    r"|interpretation|discussion|significance|summary)"
+    r"(?:\s*/\s*(?:background|objectives?|aims?|methods?|results?|conclusions?|findings))*"
+)
+
+# Structured-abstract headers written with a colon, e.g. "Results:" or
+# "Background/Objectives:".
+_SECTION_HEADER_RE = re.compile(rf"(?:^|[\s.;])({_SECTION_WORDS})\s*:", re.IGNORECASE)
+
+# Some journals omit the colon ("... decline. Methods Thirty-six older adults
+# will be ..."). Require the capitalised form followed by a capitalised word so
+# ordinary prose ("standard methods were used") is not treated as a header.
+_SECTION_HEADER_NO_COLON_RE = re.compile(
+    rf"(?:^|[\s.;])({_SECTION_WORDS})\b\s+(?=[A-Z(\[]|\d)"
+)
+
+# Sections that report what the study actually found, best first.
+_FINDING_SECTIONS = ("conclusion", "result", "finding", "interpretation", "outcome")
+# Sections that describe motivation or procedure rather than a finding.
+_NON_FINDING_SECTIONS = (
+    "background", "introduction", "context", "rationale", "objective",
+    "purpose", "aim", "goal", "method", "design", "setting", "participant",
+)
+
+# Phrasing that signals a reported result.
+_RESULT_MARKERS = (
+    "found that", "we found", "showed that", "shown that", "demonstrated",
+    "revealed", "indicated that", "results showed", "results suggest",
+    "findings suggest", "concluded", "we conclude", "evidence suggests",
+    "significantly", "significant improvement", "significant increase",
+    "significant reduction", "no significant", "compared with", "compared to",
+    "relative to placebo", "versus placebo", "associated with", "correlated",
+    "resulted in", "led to", "improved", "reduced", "increased", "decreased",
+    "enhanced", "greater than", "lower than", "effect size", "did not differ",
+)
+
+# Phrasing that signals motivation, framing, or an unanswered gap - never a finding.
+_AIM_MARKERS = (
+    "aimed to", "aim of", "aims to", "objective of", "purpose of",
+    "this study evaluates", "this study examines", "this study investigates",
+    "this study aimed", "this review", "we investigated whether", "we sought",
+    "we aimed", "this investigation aimed", "the goal of", "we examine",
+    "have not been", "has not been", "remains unclear", "remain unclear",
+    "little is known", "is well-established", "are well-established",
+    "is needed", "warrants", "future research", "we hypothesized",
+    "we hypothesize", "we hypothesise", "hypothesized that", "hypothesize that",
+    "the present study", "here we describe", "this paper",
+)
+
+# Quantitative evidence - a strong sign the sentence carries a real result.
+_QUANT_RE = re.compile(
+    r"(p\s*[=<>]\s*0?\.\d+"
+    r"|\d+(?:\.\d+)?\s*%"
+    r"|95\s*%\s*ci"
+    r"|\bci\b"
+    r"|\b(?:cohen'?s\s*d|hedges'?\s*g|smd|md|or|rr|hr|β|beta)\s*[=:]\s*-?\d"
+    r"|\bn\s*=\s*\d+"
+    r"|\bd\s*=\s*-?\d)",
+    re.IGNORECASE,
+)
+
+# Study protocols describe planned work, not results.
+_FUTURE_TENSE_RE = re.compile(
+    r"\bwill\s+(?:be|include|consist|perform|receive|assess|measure|assign|"
+    r"recruit|undergo|evaluate|compare|determine|provide|result|lead|improve|"
+    r"increase|reduce|show|demonstrate|enhance|have|allow|help)\b"
+    r"|\b(?:is|are)\s+expected\s+to\b"
+    r"|\bthis\s+protocol\b"
+    r"|\btrial\s+registration\b"
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[]|\d)")
+
+_MAX_SUMMARY_CHARS = 240
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split prose into sentences without breaking on decimals or 'e.g.'."""
+    if not text:
+        return []
+    protected = re.sub(r"(\d)\.(\d)", r"\1<DOT>\2", text)
+    for abbr in ("e.g.", "i.e.", "vs.", "approx.", "Dr.", "et al.", "cf."):
+        protected = protected.replace(abbr, abbr.replace(".", "<DOT>"))
+    parts = _SENTENCE_SPLIT_RE.split(protected)
+    return [p.replace("<DOT>", ".").strip() for p in parts if p.strip()]
+
+
+def _find_section_headers(abstract: str) -> list[re.Match[str]]:
+    """Locate section headers, preferring the unambiguous colon form."""
+    matches = list(_SECTION_HEADER_RE.finditer(abstract))
+    if matches:
+        return matches
+    # Only fall back to colon-less headers when at least two are present, which
+    # signals a genuinely structured abstract rather than a coincidental word.
+    loose = [
+        match
+        for match in _SECTION_HEADER_NO_COLON_RE.finditer(abstract)
+        if match.group(1)[:1].isupper()
+    ]
+    return loose if len(loose) >= 2 else []
+
+
+def _split_sections(abstract: str) -> List[tuple[str, str]]:
+    """Split a structured abstract into (section_name, body) pairs.
+
+    Returns a single ("", abstract) pair when the abstract is unstructured.
+    """
+    matches = _find_section_headers(abstract)
+    if not matches:
+        return [("", abstract)]
+
+    sections: List[tuple[str, str]] = []
+    preamble = abstract[: matches[0].start()].strip()
+    if preamble:
+        sections.append(("", preamble))
+
+    for idx, match in enumerate(matches):
+        name = match.group(1).lower()
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(abstract)
+        body = abstract[start:end].strip()
+        if body:
+            sections.append((name, body))
+    return sections
+
+
+_LEADING_HEADER_RE = re.compile(rf"^{_SECTION_WORDS}\s*[:\-–]?\s+", re.IGNORECASE)
+
+
+def _truncate(sentence: str) -> str:
+    # A colon-less header can survive sentence splitting ("Results Consistent
+    # increases in ..."); drop it so the summary reads as prose.
+    sentence = _LEADING_HEADER_RE.sub("", sentence).strip()
+    if len(sentence) <= _MAX_SUMMARY_CHARS:
+        return sentence
+    return sentence[:_MAX_SUMMARY_CHARS].rsplit(" ", 1)[0] + "..."
+
+
+def _score_finding_sentence(sentence: str, section: str) -> float:
+    """Score how much a sentence reads like a reported finding."""
+    lower = sentence.lower()
+    score = 0.0
+
+    if any(key in section for key in _FINDING_SECTIONS):
+        score += 6.0
+    elif any(key in section for key in _NON_FINDING_SECTIONS):
+        score -= 5.0
+
+    score += 2.0 * sum(1 for marker in _RESULT_MARKERS if marker in lower)
+    score -= 3.0 * sum(1 for marker in _AIM_MARKERS if marker in lower)
+
+    quant_hits = len(_QUANT_RE.findall(sentence))
+    score += 2.5 * min(quant_hits, 3)
+
+    # Registered protocols describe work not yet done, so future tense can never
+    # be a finding.
+    if _FUTURE_TENSE_RE.search(lower):
+        score -= 8.0
+
+    # Very short fragments rarely state a complete result.
+    words = len(sentence.split())
+    if words < 6:
+        score -= 4.0
+    elif words > 60:
+        score -= 1.0
+
+    # Citation-only or reference-heavy sentences are usually background.
+    if re.search(r"\[\d+(?:\s*,\s*\d+)*\]", sentence):
+        score -= 2.0
+
+    return score
+
+
 def _extract_key_findings_from_abstract(abstract: str) -> str | None:
-    """Extract the most informative sentence from an abstract focusing on findings/conclusions."""
+    """Return the sentence that best states what the study actually found.
+
+    Prefers Results/Conclusions sections and sentences carrying quantitative
+    evidence; explicitly penalises Background/Objective framing so summaries
+    stop reading like "This study aimed to evaluate ...".
+    """
     if not abstract or len(abstract) < 50:
         return None
-    
-    # Split into sentences
-    sentences = []
-    for sep in [". ", ".\n"]:
-        if sep in abstract:
-            parts = abstract.split(sep)
-            sentences = [s.strip() + "." for s in parts if s.strip()]
-            break
-    
-    if not sentences:
-        sentences = [abstract.strip()]
-    
-    # Prioritize sentences with findings/results keywords
-    findings_keywords = [
-        "found that", "showed that", "demonstrated", "revealed", "indicates",
-        "results suggest", "findings", "concluded", "evidence suggests",
-        "significantly", "improved", "reduced", "increased", "enhanced",
-        "effect", "associated with", "correlated", "relationship",
-    ]
-    
-    for sentence in sentences:
-        sentence_lower = sentence.lower()
-        if any(kw in sentence_lower for kw in findings_keywords):
-            # Found a findings sentence
-            if len(sentence) > 200:
-                # Truncate long sentences
-                return sentence[:200].rsplit(" ", 1)[0] + "..."
-            return sentence
-    
-    # If no findings sentence, try to find a conclusion-like sentence (often near end)
-    for sentence in reversed(sentences[-3:]):
-        if len(sentence) > 30 and not sentence.lower().startswith(("background", "introduction", "purpose", "objective", "aim")):
-            if len(sentence) > 200:
-                return sentence[:200].rsplit(" ", 1)[0] + "..."
-            return sentence
-    
-    # Return the longest informative sentence
-    best = max(sentences, key=len) if sentences else None
-    if best and len(best) > 200:
-        return best[:200].rsplit(" ", 1)[0] + "..."
-    return best
+
+    candidates: List[tuple[float, int, str]] = []
+    position = 0
+    for section, body in _split_sections(abstract):
+        for sentence in _split_sentences(body):
+            position += 1
+            if len(sentence) < 25:
+                continue
+            candidates.append((_score_finding_sentence(sentence, section), position, sentence))
+
+    if not candidates:
+        return None
+
+    best_score, _, best_sentence = max(candidates, key=lambda item: (item[0], -item[1]))
+
+    # Everything scored as framing/motivation: prefer a late sentence, which in
+    # an unstructured abstract is usually the takeaway.
+    if best_score <= 0:
+        tail = [c for c in candidates if c[1] >= max(1, position - 2)]
+        pool = tail or candidates
+        _, _, best_sentence = max(pool, key=lambda item: item[0])
+
+    return _truncate(best_sentence)
 
 
 def _fallback_extract(paper: Paper) -> StudyExtraction:

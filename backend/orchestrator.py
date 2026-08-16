@@ -21,6 +21,24 @@ from .schemas import (
 from .storage import save_run
 
 
+def _was_rate_limited(logs: dict[str, Any]) -> bool:
+    """Report whether any search in this run was rejected with HTTP 429.
+
+    An empty result set caused by throttling must not be presented as "no
+    research exists on this topic".
+    """
+    def walk(node: Any) -> bool:
+        if isinstance(node, dict):
+            if node.get("rate_limited"):
+                return True
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(item) for item in node)
+        return False
+
+    return walk(logs)
+
+
 def _merge_sub_results(
     sub_results: list[SubQuestionResult],
 ) -> tuple[list[Paper], list[StudyExtraction], list[Critique]]:
@@ -135,7 +153,9 @@ async def run_question(question: str) -> RunResponse:
         )
 
     # Synthesize with full context
-    synthesis = await synthesize(question, papers, extractions, critiques, llm)
+    synthesis = await synthesize(
+        question, papers, extractions, critiques, llm, rate_limited=_was_rate_limited(logs)
+    )
     logs["synthesize"] = {"initial": synthesis.model_dump()}
 
     # Verify
@@ -332,7 +352,9 @@ async def run_question_with_progress(question: str) -> AsyncGenerator[dict[str, 
     # Synthesizer
     yield {"type": "progress", "agent": "synthesizer", "status": "running"}
     try:
-        synthesis = await synthesize(question, papers, extractions, critiques, llm)
+        synthesis = await synthesize(
+        question, papers, extractions, critiques, llm, rate_limited=_was_rate_limited(logs)
+    )
         logs["synthesize"] = {"initial": synthesis.model_dump()}
         yield {"type": "progress", "agent": "synthesizer", "status": "completed"}
     except Exception as e:

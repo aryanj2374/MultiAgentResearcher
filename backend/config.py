@@ -36,6 +36,11 @@ class Settings:
     )
     semantic_scholar_timeout_s: float = _env_float("SEMANTIC_SCHOLAR_TIMEOUT_S", 20)
     semantic_scholar_api_key: str = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    # Minimum gap between Semantic Scholar requests. The unauthenticated pool is
+    # shared and returns 429 well below 1 req/s, so default conservatively.
+    semantic_scholar_min_interval_s: float = _env_float(
+        "SEMANTIC_SCHOLAR_MIN_INTERVAL_S", 1.2 if os.getenv("SEMANTIC_SCHOLAR_API_KEY") else 3.0
+    )
     semantic_scholar_user_agent: str = os.getenv(
         "SEMANTIC_SCHOLAR_USER_AGENT", "multi-agent-research-assistant"
     )

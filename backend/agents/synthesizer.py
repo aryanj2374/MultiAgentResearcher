@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+from collections import Counter
 from typing import List
+
+from pydantic import ValidationError
 
 from ..llm import ChatLLM, LLMRequestError, LLMUnavailableError
 from ..schemas import Critique, Paper, StudyExtraction, Synthesis
@@ -80,8 +84,232 @@ def _cited_paper_ids(
     ]
 
 
-def _no_evidence_synthesis(question: str) -> Synthesis:
-    """Generate a helpful synthesis when no papers were found."""
+# Keys the model uses for the prose part of a bullet when it returns objects
+# instead of plain strings.
+_TEXT_KEYS = ("text", "point", "bullet", "content", "statement", "claim", "finding", "answer")
+# Keys holding the citation label(s) alongside that prose.
+_CITE_KEYS = ("citation", "citations", "cite", "cites", "refs", "references", "source", "sources")
+
+
+def _flatten_citations(value: object) -> List[str]:
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        labels: List[str] = []
+        for item in value:
+            labels.extend(_flatten_citations(item))
+        return labels
+    if isinstance(value, dict):
+        for key in ("label", "citation", "id", "paper_id", "name"):
+            if key in value:
+                return _flatten_citations(value[key])
+    return []
+
+
+def _stringify_bullet(item: object) -> str:
+    """Render one final_answer entry as text with inline [Citations].
+
+    Models frequently return {"text": ..., "citation": ...} objects rather than
+    the plain strings the schema requires. Dropping those responses loses a good
+    synthesis, so fold the citation back into the sentence instead.
+    """
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return str(item).strip()
+
+    text = ""
+    for key in _TEXT_KEYS:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            break
+    if not text:
+        # Unrecognised shape: use the longest string value present.
+        strings = [v.strip() for v in item.values() if isinstance(v, str) and v.strip()]
+        if not strings:
+            return ""
+        text = max(strings, key=len)
+
+    labels: List[str] = []
+    for key in _CITE_KEYS:
+        if key in item:
+            labels.extend(_flatten_citations(item[key]))
+
+    # Keep labels the prose already cites inline from being appended twice.
+    existing = set()
+    for group in re.findall(r"\[([^\]]+)\]", text):
+        existing.update(part.strip() for part in group.split(","))
+    new_labels = [label for label in dict.fromkeys(labels) if label and label not in existing]
+    if new_labels:
+        text = f"{text} [{', '.join(new_labels)}]"
+    return text
+
+
+def _normalize_synthesis_payload(
+    data: object, papers: List[Paper], citation_map: dict[str, str]
+) -> dict:
+    """Coerce a raw LLM payload into the shape Synthesis expects.
+
+    The schema is strict (list[str], int, paper ids), but model output varies:
+    bullets arrive as objects, consensus as a list, scores as "85%" strings, and
+    citations_used as display labels rather than paper ids. Normalising here
+    keeps a usable synthesis instead of silently falling back to heuristics.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Synthesis payload is not a JSON object")
+
+    payload = dict(data)
+
+    bullets = payload.get("final_answer")
+    if isinstance(bullets, (str, dict)):
+        bullets = [bullets]
+    if isinstance(bullets, list):
+        payload["final_answer"] = [
+            text for text in (_stringify_bullet(item) for item in bullets) if text
+        ]
+
+    consensus = payload.get("evidence_consensus")
+    if isinstance(consensus, (list, tuple)):
+        parts = [_stringify_bullet(item) for item in consensus]
+        payload["evidence_consensus"] = " ".join(part for part in parts if part)
+    elif isinstance(consensus, dict):
+        payload["evidence_consensus"] = _stringify_bullet(consensus)
+
+    for key in ("top_limitations_overall", "confidence_rationale"):
+        value = payload.get(key)
+        if isinstance(value, (str, dict)):
+            value = [value]
+        if isinstance(value, list):
+            payload[key] = [
+                text for text in (_stringify_bullet(item) for item in value) if text
+            ]
+
+    score = payload.get("confidence_score")
+    if isinstance(score, str):
+        match = re.search(r"-?\d+(?:\.\d+)?", score)
+        score = float(match.group()) if match else None
+    if isinstance(score, float):
+        score = round(score)
+    if isinstance(score, bool) or not isinstance(score, int):
+        score = None
+    if score is not None:
+        # Some models answer 0-1 instead of 0-100.
+        payload["confidence_score"] = max(0, min(100, score))
+
+    # citations_used must be paper ids; models often return display labels.
+    label_to_id = {label: paper_id for paper_id, label in citation_map.items()}
+    valid_ids = {paper.paper_id for paper in papers}
+    raw_citations = payload.get("citations_used")
+    resolved: List[str] = []
+    for entry in _flatten_citations(raw_citations):
+        if entry in valid_ids:
+            resolved.append(entry)
+        elif entry in label_to_id:
+            resolved.append(label_to_id[entry])
+    payload["citations_used"] = list(dict.fromkeys(resolved))
+
+    return payload
+
+
+def _has_citation(text: str) -> bool:
+    return bool(re.search(r"\[[^\]]+\]", text or ""))
+
+
+class HallucinatedCitationError(ValueError):
+    """Raised when a synthesis cites papers that are not in the evidence set."""
+
+
+# Matches citation labels such as [Smith2024], [Smith2024a] or [Smithn.d.].
+_LABEL_RE = re.compile(r"^\S+?(?:\d{4}|n\.d\.)(?:[a-z]|-\d+)?$")
+
+
+def _assert_citations_exist(synthesis: Synthesis, citation_map: dict[str, str]) -> None:
+    """Reject a synthesis that invents sources.
+
+    Small instruction-tuned models will confidently cite papers that were never
+    retrieved. Presenting that as evidence is worse than presenting nothing, so
+    an unknown label discards the whole LLM synthesis in favour of the
+    deterministic fallback.
+    """
+    allowed = set(citation_map.values())
+    seen: set[str] = set()
+    for text in list(synthesis.final_answer) + [synthesis.evidence_consensus]:
+        for group in re.findall(r"\[([^\]]+)\]", text or ""):
+            for part in group.split(","):
+                label = part.strip()
+                if label and _LABEL_RE.match(label):
+                    seen.add(label)
+
+    invented = sorted(seen - allowed)
+    if invented:
+        raise HallucinatedCitationError(
+            f"Synthesis cited papers absent from the evidence set: {', '.join(invented)}"
+        )
+
+
+def _reconcile_citations(
+    synthesis: Synthesis, papers: List[Paper], citation_map: dict[str, str]
+) -> Synthesis:
+    """Repair citation bookkeeping the referee would otherwise reject.
+
+    A missing consensus citation or a citations_used list that disagrees with
+    the inline labels are both mechanically derivable, so fixing them here
+    avoids a wasted second LLM round-trip that rarely improves the prose.
+    """
+    updates: dict[str, object] = {}
+
+    consensus = synthesis.evidence_consensus
+    if consensus and not _has_citation(consensus):
+        labels = list(
+            dict.fromkeys(
+                part.strip()
+                for bullet in synthesis.final_answer
+                for group in re.findall(r"\[([^\]]+)\]", bullet)
+                for part in group.split(",")
+                if part.strip()
+            )
+        )[:4]
+        if labels:
+            consensus = f"{consensus.rstrip()} [{', '.join(labels)}]"
+            updates["evidence_consensus"] = consensus
+
+    cited = _cited_paper_ids(list(synthesis.final_answer) + [consensus], papers, citation_map)
+    if set(cited) != set(synthesis.citations_used):
+        updates["citations_used"] = cited
+
+    return synthesis.model_copy(update=updates) if updates else synthesis
+
+
+def _no_evidence_synthesis(question: str, rate_limited: bool = False) -> Synthesis:
+    """Generate a helpful synthesis when no papers were found.
+
+    A rate-limited search is a very different situation from a genuinely empty
+    one, so say which happened instead of implying the literature is thin.
+    """
+    if rate_limited:
+        return Synthesis(
+            final_answer=[
+                "No answer could be produced because the Semantic Scholar search was rate limited.",
+                "This is a temporary API limit, not a sign that research on this topic is unavailable.",
+                "Wait a minute and ask again; the search should succeed once the limit resets.",
+                "Setting SEMANTIC_SCHOLAR_API_KEY in backend/.env raises the request allowance.",
+            ],
+            evidence_consensus=(
+                "No evidence was retrieved, so no consensus can be reported. "
+                "The search itself failed rather than returning zero results."
+            ),
+            top_limitations_overall=[
+                "Semantic Scholar returned HTTP 429 (rate limited) for every search attempt.",
+                "No papers were analysed, so nothing here is evidence-based.",
+            ],
+            confidence_score=0,
+            confidence_rationale=[
+                "Confidence is 0 because the literature search never completed.",
+            ],
+            citations_used=[],
+        )
+
     return Synthesis(
         final_answer=[
             "No academic papers were found for this specific query.",
@@ -213,55 +441,105 @@ def _generate_direct_answer(
                 return f"Current evidence is inconclusive ({total} studies reviewed). No clear pattern emerges, though methodological limitations may partially explain conflicting results. {citation_str}"
 
 
+_THEME_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("weight and body composition", ("weight", "fat mass", "lean mass", "body mass", "bmi", "obesity", "body composition")),
+    ("metabolic health", ("metabolic", "insulin", "glucose", "blood sugar", "metabolism", "lipid", "cholesterol")),
+    ("cardiovascular outcomes", ("cardiovascular", "heart", "blood pressure", "vascular", "cardiac")),
+    ("cognitive function", ("cognitive", "cognition", "memory", "brain", "mental", "attention", "executive function", "reaction time")),
+    ("physical performance", ("strength", "performance", "power", "endurance", "muscle", "exercise", "sprint", "training", "recovery", "soreness")),
+    ("safety and tolerability", ("adverse", "side effect", "safety", "tolerab", "harm", "risk of")),
+    ("adherence and sustainability", ("adherence", "compliance", "sustainable", "long-term", "dropout", "retention")),
+)
+
+# A claim only earns a direct quote if it reads like a result rather than a
+# placeholder produced when no abstract was available.
+_NON_FINDING_PREFIXES = ("study examining:", "no abstract available")
+
+
+def _is_reportable_finding(claim: str) -> bool:
+    text = (claim or "").strip()
+    if len(text) < 30:
+        return False
+    return not text.lower().startswith(_NON_FINDING_PREFIXES)
+
+
+def _theme_for(claim: str) -> str:
+    lowered = claim.lower()
+    for theme, keywords in _THEME_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return theme
+    return "general outcomes"
+
+
+def _shorten(claim: str, limit: int = 220) -> str:
+    claim = " ".join(claim.split())
+    if len(claim) <= limit:
+        return claim
+    return claim[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _describe_direction(pos: int, neg: int, total: int) -> str:
+    """Describe a theme's evidence without overstating a minority signal."""
+    if pos and pos > total / 2:
+        return f"most studies report benefits ({pos}/{total})"
+    if neg and neg > total / 2:
+        return f"most studies report no benefit ({neg}/{total})"
+    if pos and neg:
+        return f"findings conflict ({pos} positive vs {neg} negative/null of {total})"
+    if pos:
+        return f"{pos} of {total} studies report benefits; the rest are unclear"
+    if neg:
+        return f"{neg} of {total} studies report no benefit; the rest are unclear"
+    return f"effects are unclear across {total} studies"
+
+
 def _extract_key_themes(extractions: List[StudyExtraction], citation_map: dict[str, str]) -> List[str]:
-    """Extract and group key themes from studies rather than listing individual papers."""
-    themes: dict[str, List[str]] = {}
-    
-    # Group by effect direction and extract common findings
-    for e in extractions:
-        # Try to extract the main outcome from claim summary
-        claim = e.claim_summary.lower()
-        
-        # Categorize by common theme keywords
-        if any(w in claim for w in ["weight", "fat", "body mass", "bmi", "obesity"]):
-            theme = "weight and body composition"
-        elif any(w in claim for w in ["metabolic", "insulin", "glucose", "blood sugar", "metabolism"]):
-            theme = "metabolic health"
-        elif any(w in claim for w in ["cardiovascular", "heart", "blood pressure", "cholesterol"]):
-            theme = "cardiovascular outcomes"
-        elif any(w in claim for w in ["cognitive", "memory", "brain", "mental"]):
-            theme = "cognitive function"
-        elif any(w in claim for w in ["adherence", "compliance", "sustainable", "long-term"]):
-            theme = "adherence and sustainability"
-        else:
-            theme = "general outcomes"
-        
-        label = citation_map.get(e.paper_id, "Unknown")
-        if theme not in themes:
-            themes[theme] = []
-        themes[theme].append((label, e.effect_direction, e.claim_summary))
-    
-    bullets = []
-    for theme, studies in themes.items():
+    """Group studies by outcome theme and quote what they actually found.
+
+    Each bullet leads with a real finding from an abstract rather than a bare
+    study count, so the reader sees evidence instead of bookkeeping.
+    """
+    themes: dict[str, List[tuple[str, str | None, str]]] = {}
+    for extraction in extractions:
+        claim = extraction.claim_summary or ""
+        label = citation_map.get(extraction.paper_id, "Unknown")
+        themes.setdefault(_theme_for(claim), []).append(
+            (label, extraction.effect_direction, claim)
+        )
+
+    # Report the best-evidenced themes first.
+    ordered = sorted(themes.items(), key=lambda item: len(item[1]), reverse=True)
+
+    bullets: List[str] = []
+    for theme, studies in ordered:
+        reportable = [s for s in studies if _is_reportable_finding(s[2])]
+        pos = sum(1 for s in studies if s[1] == "positive")
+        neg = sum(1 for s in studies if s[1] in ("negative", "null"))
+
+        if not reportable:
+            # Nothing quotable (e.g. abstracts were unavailable) - say so plainly
+            # instead of implying a finding exists.
+            labels = ", ".join(label for label, _, _ in studies[:3])
+            bullets.append(
+                f"**{theme.title()}**: {len(studies)} studies matched this outcome, but no "
+                f"usable findings could be extracted from their abstracts. [{labels}]"
+            )
+            continue
+
+        # Lead with a finding that has a clear direction where one exists.
+        directional = [s for s in reportable if s[1] in ("positive", "negative", "null")]
+        label, _, claim = (directional or reportable)[0]
+
         if len(studies) >= 2:
-            # Synthesize multiple studies on same theme
-            pos = [s for s in studies if s[1] == "positive"]
-            neg = [s for s in studies if s[1] in ("negative", "null")]
-            labels = [s[0] for s in studies[:3]]
-            
-            if len(pos) > len(neg):
-                bullets.append(f"**{theme.title()}**: Multiple studies show positive effects ({len(pos)}/{len(studies)} studies). [{', '.join(labels)}]")
-            elif len(neg) > len(pos):
-                bullets.append(f"**{theme.title()}**: Studies generally show limited or no significant effects ({len(neg)}/{len(studies)} studies). [{', '.join(labels)}]")
-            else:
-                bullets.append(f"**{theme.title()}**: Results are mixed across {len(studies)} studies examining this outcome. [{', '.join(labels)}]")
-        elif studies:
-            # Single study on theme
-            label, direction, claim = studies[0]
-            if len(claim) > 100:
-                claim = claim[:100] + "..."
-            bullets.append(f"**{theme.title()}**: {claim} [{label}]")
-    
+            others = [s[0] for s in reportable[1:3]]
+            support = f" Other studies on this outcome: {', '.join(others)}." if others else ""
+            bullets.append(
+                f"**{theme.title()}**: {_shorten(claim)} [{label}] "
+                f"Across {len(studies)} studies, {_describe_direction(pos, neg, len(studies))}.{support}"
+            )
+        else:
+            bullets.append(f"**{theme.title()}**: {_shorten(claim)} [{label}]")
+
     return bullets[:5]
 
 
@@ -324,18 +602,45 @@ def _fallback_synthesis(
     high_quality = [e for e in extractions if e.study_type in ("meta_analysis", "systematic_review", "RCT")]
     if high_quality:
         hq_labels = [citation_map.get(e.paper_id, "Unknown") for e in high_quality[:3]]
-        hq_types = list(set(e.study_type.replace("_", "-") for e in high_quality))
-        bullets.append(f"**High-quality evidence**: {len(high_quality)} {'/'.join(hq_types)} provide stronger evidence. [{', '.join(hq_labels)}]")
+        type_names = {
+            "meta_analysis": "meta-analyses",
+            "systematic_review": "systematic reviews",
+            "RCT": "randomized controlled trials",
+        }
+        counts = Counter(e.study_type for e in high_quality)
+        breakdown = ", ".join(
+            f"{count} {type_names.get(study_type, study_type)}"
+            for study_type, count in counts.most_common()
+        )
+        bullets.append(
+            f"**Strongest evidence**: {breakdown} carry the most weight here. "
+            f"[{', '.join(hq_labels)}]"
+        )
     
-    # 4. Add sample size context if significant
-    sample_sizes = [e.sample_size for e in extractions if e.sample_size]
-    if sample_sizes and sum(sample_sizes) > 500:
-        total_n = sum(sample_sizes)
-        sampled = [e for e in extractions if e.sample_size]
+    # 4. Add sample size context if significant. Reviews pool participants from
+    # the primary studies, so summing both would double-count people.
+    primary = [
+        e
+        for e in extractions
+        if e.sample_size and e.study_type not in ("meta_analysis", "systematic_review")
+    ]
+    pooled = [
+        e
+        for e in extractions
+        if e.sample_size and e.study_type in ("meta_analysis", "systematic_review")
+    ]
+    if primary and sum(e.sample_size for e in primary) > 500:
+        total_n = sum(e.sample_size for e in primary)
+        note = (
+            f" A further {len(pooled)} review(s) pool participants from primary studies "
+            f"and are excluded to avoid double-counting."
+            if pooled
+            else ""
+        )
         bullets.append(
             f"**Sample coverage**: Combined N = {total_n:,} participants across "
-            f"{len(sample_sizes)} studies with reported sample sizes. "
-            f"{_citation_text(sampled, citation_map)}"
+            f"{len(primary)} primary studies with reported sample sizes.{note} "
+            f"{_citation_text(primary, citation_map)}"
         )
     
     # 5. Note key limitations affecting conclusions
@@ -383,24 +688,44 @@ def _fallback_synthesis(
     if not limitations:
         limitations = ["Abstract-only synthesis; detailed methodology not assessed."]
 
-    # Calculate confidence score with quality weighting
+    # Calculate confidence from evidence volume, study quality, bias, and
+    # agreement. Bias penalties are proportional: counting them absolutely meant
+    # every extra paper lowered the score, so a large body of medium-bias
+    # evidence scored worse than a single unassessed study.
     high_bias = sum(1 for c in critiques if c.risk_of_bias == "high")
     medium_bias = sum(1 for c in critiques if c.risk_of_bias == "medium")
-    
-    # Base score considers quantity, quality, and consistency
-    base_score = min(70, 35 + len(papers) * 4 + len(high_quality) * 6)
-    score = base_score - high_bias * 12 - medium_bias * 6
-    
-    # Adjust for consensus
-    if pos_pct > 70 or pos_pct < 30:  # Clear direction = higher confidence
-        score += 5
-    elif 40 < pos_pct < 60:  # Split evidence = lower confidence
-        score -= 8
-    
-    score = max(15, min(85, score))
+    assessed = len(critiques) or 1
+    high_bias_share = high_bias / assessed
+    medium_bias_share = medium_bias / assessed
+    hq_share = len(high_quality) / len(extractions) if extractions else 0.0
+
+    # Volume saturates: the 12th study adds far less than the 3rd.
+    volume_points = min(20.0, 7.0 * math.log2(1 + len(papers)))
+    quality_points = 25.0 * hq_share
+    score = 35.0 + volume_points + quality_points
+
+    # A body of evidence that is mostly high-bias loses more than one that is
+    # merely unblinded or abstract-assessed.
+    score -= 25.0 * high_bias_share
+    score -= 8.0 * medium_bias_share
+
+    # Agreement between studies matters more than the direction of the effect.
+    if pos_pct > 70 or pos_pct < 30:
+        score += 6.0
+    elif 40 < pos_pct < 60:
+        score -= 8.0
+
+    # Very thin evidence should never look authoritative.
+    if len(papers) < 3:
+        score = min(score, 40.0)
+
+    score = int(round(max(10, min(90, score))))
 
     rationale = []
-    rationale.append(f"Synthesis of {len(papers)} studies ({len(high_quality)} high-quality).")
+    rationale.append(
+        f"Synthesis of {len(papers)} studies, {len(high_quality)} of them "
+        f"randomized trials or reviews ({hq_share:.0%} of the evidence)."
+    )
     if pos_pct > 60:
         rationale.append(f"Evidence predominantly supports positive effects ({int(pos_pct)}% weighted).")
     elif pos_pct < 40:
@@ -408,7 +733,13 @@ def _fallback_synthesis(
     else:
         rationale.append("Evidence is split, reducing confidence in definitive conclusions.")
     if high_bias:
-        rationale.append(f"{high_bias} studies flagged for high bias risk.")
+        rationale.append(
+            f"{high_bias} of {assessed} studies ({high_bias_share:.0%}) carry high risk of bias."
+        )
+    elif medium_bias:
+        rationale.append(
+            f"No study is high-bias, but {medium_bias} of {assessed} carry medium risk."
+        )
 
     return Synthesis(
         final_answer=bullets[:8],
@@ -497,10 +828,11 @@ async def synthesize(
     critiques: List[Critique],
     llm: ChatLLM,
     issues: List[str] | None = None,
+    rate_limited: bool = False,
 ) -> Synthesis:
     # Always use no-evidence synthesis when no papers found
     if not papers:
-        return _no_evidence_synthesis(question)
+        return _no_evidence_synthesis(question, rate_limited=rate_limited)
     
     if not llm.available:
         return _fallback_synthesis(question, papers, extractions, critiques)
@@ -515,9 +847,22 @@ async def synthesize(
         logger.info(f"Synthesizer LLM raw response (first 500 chars): {raw[:500] if raw else 'EMPTY'}")
         data = safe_json_loads(raw)
         logger.info(f"Synthesizer parsed JSON keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-        result = Synthesis.model_validate(data)
+        citation_map = _build_citation_map(papers)
+        result = Synthesis.model_validate(
+            _normalize_synthesis_payload(data, papers, citation_map)
+        )
+        if not result.final_answer:
+            raise ValueError("Synthesis contained no usable bullets")
+        _assert_citations_exist(result, citation_map)
+        result = _reconcile_citations(result, papers, citation_map)
         logger.info("Synthesizer LLM call succeeded")
         return result
+    except HallucinatedCitationError as e:
+        logger.warning(f"Discarding synthesis with fabricated citations: {e}")
+        return _fallback_synthesis(question, papers, extractions, critiques)
+    except ValidationError as e:
+        logger.warning(f"Synthesizer schema mismatch after normalization: {e}")
+        return _fallback_synthesis(question, papers, extractions, critiques)
     except LLMUnavailableError as e:
         logger.warning(f"Synthesizer LLM unavailable: {e}")
         return _fallback_synthesis(question, papers, extractions, critiques)
